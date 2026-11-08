@@ -51,6 +51,144 @@ static uint8_t *ram(uint64_t pa) { return hv_phys_ptr(&m, pa, 1); }
 #define ICC_IGRPEN1 ICC(3, 0, 12, 12, 7)
 #define ICC_SGI1R ICC(3, 0, 12, 11, 5)
 
+static void test_camera(void) {
+    static uint8_t y[HV_UVC_WIDTH * HV_UVC_HEIGHT], uv[sizeof y / 2];
+    uint8_t buffer[HV_UVC_PAYLOAD];
+    HvXhci *usb = hv_xhci_create_camera(&m, board.pcie);
+    check("camera controller available", usb != NULL, 1);
+    if (!usb) return;
+    HvUvc *camera = usb->camera;
+    check("camera port disconnected by default", usb->portsc[0] & 1, 0);
+    check("camera ignores frames until enabled", hv_uvc_submit(camera, y, HV_UVC_WIDTH, uv, HV_UVC_WIDTH), 0);
+    hv_xhci_camera_share(usb, true);
+    hv_xhci_poll(usb);
+    check("camera port connects when enabled", usb->portsc[0] & 1, 1);
+    check("camera port is high speed", (usb->portsc[0] >> 10) & 15, 3);
+
+    uint8_t request[8] = {0x80, 6, 0, 2, 0, 0, 255, 0};
+    int size = hv_uvc_control(camera, request, buffer, 255);
+    check("camera configuration descriptor size", size, 159);
+    if (size != 159) return;
+    check("camera advertises total descriptor size", buffer[2] | buffer[3] << 8, size);
+    int offset = 0;
+    while (offset < size && buffer[offset] >= 2) offset += buffer[offset];
+    check("camera descriptor boundaries", offset, size);
+
+    memset(y, 90, sizeof y);
+    memset(uv, 128, sizeof uv);
+    uv[0] = 119;
+    check("camera accepts the current frame", hv_uvc_submit(camera, y, HV_UVC_WIDTH, uv, HV_UVC_WIDTH), 1);
+    check("guest needs to select a streaming mode", hv_uvc_payload(camera, buffer, sizeof buffer), 0);
+    memcpy(request, (uint8_t[]){0xa1, 0x81, 0, 1, 1, 0, 26, 0}, 8);
+    check("guest gets UVC probe", hv_uvc_control(camera, request, buffer, 26), 26);
+    uint32_t interval;
+    memcpy(&interval, buffer + 4, sizeof interval);
+    check("camera offers 30 fps to the guest", interval, 333333);
+    memcpy(request, (uint8_t[]){0x21, 1, 0, 2, 1, 0, 26, 0}, 8);
+    check("guest commits the supported camera mode", hv_uvc_control(camera, request, buffer, 26), 0);
+    size_t bytes = hv_uvc_payload(camera, buffer, 512);
+    check("camera starts the payload in a smaller USB read", bytes, 512);
+    check("camera starts with the native NV12 luma plane", buffer[2] | buffer[3] << 8 | buffer[4] << 16 | (uint32_t)buffer[5] << 24, 0x5a5a5a5a);
+    size_t frame = bytes > 2 ? bytes - 2 : 0;
+    uint8_t fid = buffer[1] & 1;
+    bytes = hv_uvc_payload(camera, buffer, HV_UVC_PAYLOAD - 512);
+    check("camera continues the split USB payload", bytes, HV_UVC_PAYLOAD - 512);
+    check("continuation starts with pixels instead of a second header", buffer[0], 90);
+    frame += bytes;
+    uint32_t first_chroma = 0;
+    do {
+        bytes = hv_uvc_payload(camera, buffer, sizeof buffer);
+        if (!bytes) break;
+        if (frame <= sizeof y && frame + bytes - 2 >= sizeof y + 2) {
+            size_t chroma = 2 + sizeof y - frame;
+            first_chroma = buffer[chroma] | (uint32_t)buffer[chroma + 1] << 8;
+        }
+        frame += bytes - 2;
+    } while (!(buffer[1] & 2) && frame < sizeof y + sizeof uv);
+    check("camera assembles a complete NV12 frame", frame, sizeof y + sizeof uv);
+    check("native chroma plane follows luma with Cb and Cr in order", first_chroma, 0x8077);
+    check("camera sets EOF and preserves the frame ID", buffer[1], 0x82 | fid);
+    check("camera does not repeat an old frame", hv_uvc_payload(camera, buffer, sizeof buffer), 0);
+    check("camera can queue another frame", hv_uvc_submit(camera, y, HV_UVC_WIDTH, uv, HV_UVC_WIDTH), 1);
+
+    /* A posted bulk transfer can span two buffers and end with an Event Data TRB. */
+    uint64_t ring = VMAPPLE_MEM + 0x60000, payload = ring + 0x1000, events = ring + 0x2000;
+    uint32_t td[] = {
+        (uint32_t)payload, (uint32_t)(payload >> 32), 64, 1u << 10 | 0x11,
+        (uint32_t)(payload + 64), (uint32_t)(payload >> 32), 64, 1u << 10 | 0x11,
+        0x12345678, 0, 0, 7u << 10 | 0x21,
+    };
+    hv_phys_write(&m, ring, td, sizeof td);
+    wr32(ring + sizeof td + 12, 0);
+    usb->device_slot = 1;
+    usb->ep[3] = (HvXhciRing){.dequeue = ring, .ccs = 1};
+    usb->ep_running[3] = 1;
+    usb->intr[0].erstsz = 1;
+    usb->intr[0].seg_base = events;
+    usb->intr[0].seg_size = 16;
+    hv_xhci_poll(usb);
+    check("bulk TD gets video across both buffers", rd8(payload + 64), 90);
+    check("bulk TD completes at the Event Data pointer", rd32(events), 0x12345678);
+    check("bulk completion reports transferred length", rd32(events + 8), 1u << 24 | 128);
+    check("bulk completion marks Event Data", rd32(events + 12) & 4, 4);
+
+    uint64_t dcbaa = ring + 0x3000, context = dcbaa + 0x100, control = ring + 0x4000;
+    uint64_t commands = ring + 0x5000, next_control = control + 0x100;
+    usb->dcbaap = dcbaa;
+    wr64(dcbaa + 8, context);
+    wr32(context + 32, 1);
+    usb->ep[1] = (HvXhciRing){.dequeue = control, .ccs = 1};
+    uint32_t optional_descriptor[] = {0x21000680, 0x000a0409, 8, 2u << 10 | 0x41};
+    hv_phys_write(&m, control, optional_descriptor, sizeof optional_descriptor);
+    usb->pci.bar_write(&usb->pci, 0, 0x2004, 1, 4);
+    check("unsupported camera request reports a stall", rd32(events + 16 + 8) >> 24, 6);
+    check("camera control endpoint halts", rd32(context + 32) & 7, 2);
+    check("halted camera exposes the failed TD pointer", rd32(context + 40), (uint32_t)control | 1);
+
+    uint32_t resume[] = {
+        0, 0, 0, 1u << 24 | 1u << 16 | 14u << 10 | 1,
+        (uint32_t)next_control | 1, (uint32_t)(next_control >> 32), 0, 1u << 24 | 1u << 16 | 16u << 10 | 1,
+        0, 0, 0, 0,
+    };
+    hv_phys_write(&m, commands, resume, sizeof resume);
+    usb->cmd = (HvXhciRing){.dequeue = commands, .ccs = 1};
+    usb->pci.bar_write(&usb->pci, 0, 0x2000, 0, 4);
+    check("guest reset leaves camera control endpoint stopped", rd32(context + 32) & 7, 3);
+    uint32_t get_probe[] = {
+        0x010081a1, 26u << 16 | 1, 8, 2u << 10 | 0x41,
+        (uint32_t)payload, (uint32_t)(payload >> 32), 26, 1u << 16 | 3u << 10 | 1,
+        0, 0, 0, 4u << 10 | 0x21,
+        0, 0, 0, 0,
+    };
+    hv_phys_write(&m, next_control, get_probe, sizeof get_probe);
+    usb->pci.bar_write(&usb->pci, 0, 0x2004, 1, 4);
+    check("camera probe works after the optional descriptor stalls", rd32(payload), 0x01010001);
+
+    uint64_t short_ring = ring + 0x100, short_buffer = ring + 0x6000;
+    uint32_t short_td[] = {
+        (uint32_t)short_buffer, (uint32_t)(short_buffer >> 32), HV_UVC_PAYLOAD, 1u << 10 | 0x15,
+        0x23456789, 0, 0, 7u << 10 | 0x21,
+        0, 0, 0, 0,
+    };
+    hv_phys_write(&m, short_ring, short_td, sizeof short_td);
+    usb->ep[3] = (HvXhciRing){.dequeue = short_ring, .ccs = 1};
+    unsigned event_index = usb->intr[0].index;
+    hv_xhci_poll(usb);
+    check("short bulk TD produces only one completion", usb->intr[0].index, event_index + 1);
+    check("short bulk TD points to the short transfer", rd32(events + event_index * 16), (uint32_t)short_ring);
+    check("short bulk TD reports the remaining bytes", rd32(events + event_index * 16 + 8), 13u << 24 | 128);
+
+    hv_xhci_camera_share(usb, false);
+    hv_xhci_poll(usb);
+    check("camera disconnects when sharing ends", usb->portsc[0] & 1, 0);
+    check("no buffered frames after camera is off", hv_uvc_payload(camera, buffer, sizeof buffer), 0);
+    hv_xhci_camera_share(usb, true);
+    hv_xhci_poll(usb);
+    check("camera reconnects after being enabled", usb->portsc[0] & 1, 1);
+    check("reconnected camera has no stale frame", hv_uvc_payload(camera, buffer, sizeof buffer), 0);
+    hv_xhci_camera_share(usb, false);
+}
+
 static void test_pvg_commands(void) {
     const uint64_t display = VMAPPLE_MEM + 0x20000;
     uint32_t setup[] = {1, 20, 0, 0, (uint32_t)(display >> 14)};
@@ -536,6 +674,7 @@ int main(void) {
     check("gpio interrupt cleared", board.gic->level[32 + VMAPPLE_IRQ_GPIO], 0);
     test_guest_programs();
     test_pvg_commands();
+    test_camera();
 
     hv_disk_close(&root);
     hv_disk_close(&aux);

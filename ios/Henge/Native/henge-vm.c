@@ -19,17 +19,19 @@
 
 HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
 
-static volatile int state;
+static _Atomic int state;
 static volatile int exit_reason;
+static pthread_mutex_t camera_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_exit(int reason) {
     exit_reason = reason;
     state = 2;
+    henge_vm_camera_share(0);
     fprintf(stderr, "henge: the machine stopped (%s)\n", hv_vm_reason_name(reason));
 }
 
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
-                  int cpus, char *err, size_t errlen) {
+                  int cpus, int camera, char *err, size_t errlen) {
     if (state) {
         snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
         return -1;
@@ -39,7 +41,7 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
         snprintf(err, errlen, "Henge has no JIT region. Turn on JIT first.");
         return -1;
     }
-    HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .seed = seed, .ram_mb = ram_mb, .ncpus = cpus, .log = 1,
+    HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .seed = seed, .ram_mb = ram_mb, .ncpus = cpus, .log = 1, .camera = camera,
                     .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
@@ -47,6 +49,29 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
     state = 1;
     hv_vm_start(1, on_exit);
     return 0;
+}
+
+int henge_vm_camera_available(void) { return state == 1 && hv_vm_board()->camera != NULL; }
+
+int henge_vm_camera_frame_rate(void) { return HV_UVC_FPS; }
+
+int henge_vm_camera_sharing(void) {
+    return henge_vm_camera_available() && hv_uvc_shared(hv_vm_board()->camera->camera);
+}
+
+int henge_vm_camera_share(int enabled) {
+    pthread_mutex_lock(&camera_lock);
+    HvXhci *camera = hv_vm_board()->camera;
+    int available = camera && (!enabled || state == 1);
+    if (available) hv_xhci_camera_share(camera, enabled != 0);
+    pthread_mutex_unlock(&camera_lock);
+    return available ? 0 : -1;
+}
+
+void henge_vm_camera_frame(const uint8_t *y, size_t y_stride, const uint8_t *uv, size_t uv_stride) {
+    if (!henge_vm_camera_available()) return;
+    HvXhci *camera = hv_vm_board()->camera;
+    if (hv_uvc_submit(camera->camera, y, y_stride, uv, uv_stride)) hv_machine_wake(camera->m);
 }
 
 static volatile int install_step = -1;

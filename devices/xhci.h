@@ -4,6 +4,7 @@
 #include <pthread.h>
 
 #include "pcie.h"
+#include "uvc.h"
 
 /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
    INTx) with a USB HID boot keyboard on port 1: what Virtualization.framework
@@ -38,9 +39,9 @@ typedef struct HvXhci {
         uint32_t seg_size, seg_index, index;
         int pcs;
     } intr[HV_XHCI_INTRS];
-    /* device slots: only the keyboard ever gets one */
+    /* Each controller exposes one device on its root port. */
     int slot_used[HV_XHCI_SLOTS + 1];
-    int kbd_slot;          /* slot the keyboard was addressed in, or 0 */
+    int device_slot;
     HvXhciRing ep[HV_XHCI_EPS];
     int ep_running[HV_XHCI_EPS];
     int configured;
@@ -50,9 +51,18 @@ typedef struct HvXhci {
     uint32_t rhead, rtail;
     uint8_t state[8];      /* modifiers, reserved, six keys: the current report */
     uint64_t delivered;
+    HvUvc *camera;
+    HvXhciRing control_start; /* retry point exposed to the guest when endpoint zero halts */
+    uint8_t control_setup[8], control_reply[256];
+    int control_length;
+    uint32_t control_transferred;
+    unsigned camera_requests;
+    uint8_t camera_payload[HV_UVC_PAYLOAD];
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
+HvXhci *hv_xhci_create_camera(HvMachine *m, HvPcie *bus);
+void hv_xhci_camera_share(HvXhci *x, bool enabled);
 /* Any thread: a key went down or up (HID usage page 7 usage, e.g. 4 = A; 0xe0-0xe7 are modifiers). */
 void hv_xhci_key(HvXhci *x, uint8_t usage, int down);
 /* The same, by Linux input key code (what the host UI produces). */

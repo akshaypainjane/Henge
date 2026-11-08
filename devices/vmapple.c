@@ -233,6 +233,7 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     hv_virtio_blk_poll(b->root_blk);
     hv_virtio_blk_poll(b->aux_blk);
     hv_xhci_poll(b->usb);
+    hv_xhci_poll(b->camera);
     hv_virtio_input_poll(b->keyboard);
     hv_virtio_input_poll(b->mouse);
     hv_virtio_snd_poll(b->snd);

@@ -55,6 +55,8 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Henge uses the local network to pair with this iPhone for JIT, without a computer.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Share your iPad’s front camera with the virtual Mac when you turn on camera sharing in Henge.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

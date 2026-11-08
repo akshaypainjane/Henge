@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import os
 
 /// The Desk: a dark, quiet page, cards on it with a hairline edge, and one blue for what you press.
 /// A Mac's screen is the only colourful thing here.
@@ -88,6 +89,12 @@ struct DeskBar: View {
 
 /// The picture of a Mac as it was last seen, kept beside its disk.
 enum MacPreview {
+    // The app runs one VM per launch. Disable captures before enabling its camera,
+    // including saves queued by the UI that have not yet taken their snapshot.
+    private static let saving = OSAllocatedUnfairLock(initialState: true)
+
+    static func disableSavingForSession() { saving.withLock { $0 = false } }
+
     static func file(for mac: VirtualMac) -> URL { mac.directory.appendingPathComponent("preview.jpg") }
 
     static func capture(width: Int, height: Int) -> CGImage? {
@@ -110,7 +117,8 @@ enum MacPreview {
     static func saveNow(for mac: VirtualMac) { write(to: file(for: mac), height: Int(640 / mac.aspect)) }
 
     private static func write(to url: URL, height: Int) {
-        guard let image = capture(width: 640, height: height), let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else { return }
+        let image = saving.withLock { enabled in enabled ? capture(width: 640, height: height) : nil }
+        guard let image, let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else { return }
         try? data.write(to: url, options: .atomic)
     }
 }

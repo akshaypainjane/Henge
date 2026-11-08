@@ -67,6 +67,7 @@ typedef struct HvVmapple {
     HvVirtioSnd *snd;
     HvVirtioInput *keyboard, *mouse;
     HvXhci *usb;             /* USB controller with the keyboard macOS actually uses */
+    HvXhci *camera;          /* optional USB webcam on its own controller */
     HvVirtioUsb *vusb;       /* the USB device port an installer talks to (installer boots only) */
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;

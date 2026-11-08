@@ -262,6 +262,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         return fail(err, errlen, "The system could not allocate memory for the virtual Mac.");
     }
     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
+    if (c->camera && !c->installer) board.camera = hv_xhci_create_camera(&m, board.pcie);
     hv_vmapple_reset_cpu(&board);
     if (board.net && !c->no_net) {
         if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");

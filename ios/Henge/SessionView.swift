@@ -8,6 +8,7 @@ struct SessionView: View {
     let close: () -> Void
 
     @StateObject private var display = DisplayRouter()
+    @StateObject private var camera = GuestCamera()
     @State private var error: String?
     @State private var state: Int32 = 0
     @State private var cpusOn: Int32 = 0
@@ -100,6 +101,7 @@ struct SessionView: View {
         .onChange(of: pointerNeeded) { PointerLock.set(!$0) }
         .onChange(of: scenePhase) { phase in
             HengeLog.log("session", "scene became \(phase)")
+            camera.sceneChanged(phase)
             guard phase != .active else {
                 display.refresh()
                 return
@@ -113,6 +115,7 @@ struct SessionView: View {
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            camera.stop()
             zoomFollowing?.cancel()
             StickyKeys.shared.releaseAll()
             HardwareKeys.releaseAll()
@@ -207,6 +210,7 @@ struct SessionView: View {
                 Spacer()
                 tool("info.circle", "Details") { showDetails = true }
                 Spacer()
+                if camera.sharing { cameraStopTool }
                 tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
             }
             .padding(.horizontal, 22)
@@ -280,6 +284,10 @@ struct SessionView: View {
         .accessibilityLabel(label)
     }
 
+    private var cameraStopTool: some View {
+        tool("video.fill", "Stop sharing iPad camera", tint: .green) { camera.stop() }
+    }
+
     // MARK: Filling the phone
 
     @ViewBuilder private func floatingControls(_ layout: Layout) -> some View {
@@ -290,6 +298,7 @@ struct SessionView: View {
             pasteTool
             tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
             tool("info.circle", "Details", tint: .white) { showDetails = true }
+            if camera.sharing { cameraStopTool }
             Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
             tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
         }
@@ -386,6 +395,19 @@ struct SessionView: View {
                     LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                 }
+                if Device.isPad {
+                    Section("iPad Camera") {
+                        LabeledContent("Status", value: camera.status)
+                        if camera.sharing || camera.busy {
+                            Button("Stop Sharing Camera") { camera.stop() }
+                        } else {
+                            Button("Share Front Camera") { camera.start() }
+                                .disabled(state != 1 || henge_vm_camera_available() == 0)
+                        }
+                        Text("Shares live video locally with this Mac. Camera access ends when Henge leaves the foreground.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
                 Section("Sharing") {
                     if sharingActive {
                         Button("Type the Set Up Command") {
@@ -428,7 +450,8 @@ struct SessionView: View {
         var buffer = [CChar](repeating: 0, count: 256)
         sharingActive = Sharing.prepare(enabled: shareFiles)
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
-        let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
+        let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus),
+                               Device.isPad ? 1 : 0, &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)
             return
@@ -473,7 +496,10 @@ struct SessionView: View {
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
             if showDetails { log = Array(HengeLog.recentLines(200)) }
-            if state == 2 { break }
+            if state == 2 {
+                camera.stop()
+                break
+            }
             tick += 1
             if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report
             if tick % 60 == 0 { MacPreview.save(for: mac) }
@@ -487,6 +513,7 @@ struct SessionView: View {
 
     private func finish() {
         if state == 1 {
+            camera.stop()
             MacPreview.saveNow(for: mac)
             henge_vm_stop()
         }

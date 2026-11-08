@@ -42,8 +42,9 @@ enum { CC_SUCCESS = 1, CC_TRB_ERROR = 5, CC_STALL = 6, CC_SLOTS_FULL = 9, CC_SHO
 #define PORT_CEC (1u << 23)
 #define PORT_CHANGES (PORT_CSC | PORT_PEC | PORT_WRC | PORT_OCC | PORT_PRC | PORT_PLC | PORT_CEC)
 #define SPEED_FULL 1
+#define SPEED_HIGH 3
 
-#define KBD_DCI_IN 3 /* endpoint 1 IN */
+#define DEVICE_DCI_IN 3 /* endpoint 1 IN */
 
 /* ---- the keyboard's descriptors (USB HID 1.11 boot keyboard) ---- */
 
@@ -139,6 +140,12 @@ static void cmd_completion(HvXhci *x, uint64_t trb_pa, int cc, int slot) {
 static void transfer_event(HvXhci *x, uint64_t trb_pa, int cc, uint32_t residual, int slot, int dci) {
     uint32_t dw2 = rd32(x, trb_pa + 8); /* each transfer TRB names its interrupter (bits 31:22) */
     event_to(x, (int)(dw2 >> 22), trb_pa, (uint32_t)cc << 24 | (residual & 0xffffff), TRB_TRANSFER_EVENT << 10 | (uint32_t)dci << 16 | (uint32_t)slot << 24);
+}
+
+static void transfer_data_event(HvXhci *x, const uint32_t trb[4], int cc, uint32_t length, int slot, int dci) {
+    uint64_t pointer = (uint64_t)trb[1] << 32 | trb[0];
+    event_to(x, (int)(trb[2] >> 22), pointer, (uint32_t)cc << 24 | (length & 0xffffff),
+             TRB_TRANSFER_EVENT << 10 | (uint32_t)dci << 16 | (uint32_t)slot << 24 | 4);
 }
 
 /* ---- rings ---- */
@@ -248,26 +255,50 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
     return len;
 }
 
-/* Run the control transfers queued on the keyboard's endpoint 0. */
+static void halt_camera_control(HvXhci *x, int slot, uint64_t trb, uint32_t residual) {
+    /* A halted TD leaves the dequeue pointer at its start so the driver can
+       discard the failed request and advance the ring after Reset Endpoint. */
+    x->ep[1] = x->control_start;
+    uint64_t dequeue = x->control_start.dequeue | (uint64_t)x->control_start.ccs;
+    wr(x, out_ctx(x, slot) + 32 + 8, &dequeue, sizeof dequeue);
+    set_ep_state(x, slot, 1, 2);
+    x->ep_running[1] = 0;
+    transfer_event(x, trb, CC_STALL, residual, slot, 1);
+}
+
+/* Run the control transfers queued on endpoint 0. */
 static void run_ep0(HvXhci *x, int slot) {
     HvXhciRing *r = &x->ep[1];
     uint32_t trb[4];
     uint64_t at;
-    uint8_t setup[8], reply[256];
-    int reply_len = 0, stalled = 0;
+    uint8_t *setup = x->control_setup, *reply = x->control_reply;
     while (ring_peek(x, r, trb, &at)) {
         int type = (trb[3] >> 10) & 0x3f;
         int ioc = (trb[3] >> 5) & 1;
         if (type == TRB_SETUP) {
-            memcpy(setup, trb, 8);
+            memcpy(setup, trb, sizeof x->control_setup);
             uint16_t wlen = (uint16_t)(setup[6] | setup[7] << 8);
-            reply_len = control(x, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
-            stalled = reply_len < 0;
+            size_t count = wlen < sizeof x->control_reply ? wlen : sizeof x->control_reply;
+            x->control_transferred = 0;
+            if (x->camera) {
+                x->control_start = *r;
+                /* Host-to-device class requests carry their parameters in the DATA TRB. */
+                x->control_length = wlen && !(setup[0] & 0x80) ? 0 : hv_uvc_control(x->camera, setup, reply, count);
+                if (x->m->log && x->camera_requests++ < 48)
+                    fprintf(stderr, "henge: camera USB request %02x/%02x value %02x%02x index %02x%02x length %u reply %d\n",
+                            setup[0], setup[1], setup[3], setup[2], setup[5], setup[4], wlen, x->control_length);
+            } else {
+                x->control_length = control(x, setup, reply, (int)count);
+            }
             ring_advance(r);
-            if (stalled) {
-                transfer_event(x, at, CC_STALL, 0, slot, 1);
-                set_ep_state(x, slot, 1, 2); /* halted */
-                x->ep_running[1] = 0;
+            if (x->control_length < 0) {
+                if (x->camera) {
+                    halt_camera_control(x, slot, at, 0);
+                } else {
+                    transfer_event(x, at, CC_STALL, 0, slot, 1);
+                    set_ep_state(x, slot, 1, 2); /* halted */
+                    x->ep_running[1] = 0;
+                }
                 return;
             }
             if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
@@ -277,14 +308,26 @@ static void run_ep0(HvXhci *x, int slot) {
             int in = (trb[3] >> 16) & 1;
             uint32_t n = 0;
             if (in) {
-                n = reply_len < 0 ? 0 : (uint32_t)reply_len < want ? (uint32_t)reply_len : want;
+                n = (uint32_t)x->control_length < want ? (uint32_t)x->control_length : want;
                 if (n) wr(x, buf, reply, n);
+            } else if (x->camera) {
+                uint32_t wlen = setup[6] | (uint32_t)setup[7] << 8;
+                if (wlen != want || want > sizeof x->control_reply || hv_phys_read(x->m, buf, reply, want) != 0 ||
+                    hv_uvc_control(x->camera, setup, reply, want) < 0) {
+                    halt_camera_control(x, slot, at, want);
+                    return;
+                }
+                n = want;
             } else {
                 n = want; /* SET_REPORT and friends: take the data and ignore it */
             }
             ring_advance(r);
+            x->control_transferred += n;
             int isp = (trb[3] >> 2) & 1;
             if (ioc || (isp && n < want)) transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, 1);
+        } else if (type == TRB_EVENT_DATA && x->camera) {
+            ring_advance(r);
+            if (ioc) transfer_data_event(x, trb, CC_SUCCESS, x->control_transferred, slot, 1);
         } else if (type == TRB_STATUS) {
             ring_advance(r);
             if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
@@ -295,11 +338,63 @@ static void run_ep0(HvXhci *x, int slot) {
     }
 }
 
+/* A bulk TD can cross a page or end with an Event Data TRB. Wait for the entire
+   TD before taking a payload so a partially posted ring never loses a frame. */
+static void run_camera_in(HvXhci *x) {
+    int slot = x->device_slot;
+    if (!slot || !x->ep_running[DEVICE_DCI_IN]) return;
+    HvXhciRing *endpoint = &x->ep[DEVICE_DCI_IN];
+    pthread_mutex_lock(&x->mu);
+    for (unsigned done = 0; done < 8; done++) {
+        struct { uint32_t trb[4]; uint64_t pa; } parts[64];
+        HvXhciRing next = *endpoint;
+        size_t capacity = 0;
+        unsigned count = 0;
+        while (count < 64 && ring_peek(x, &next, parts[count].trb, &parts[count].pa)) {
+            uint32_t *trb = parts[count++].trb;
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(&next);
+            if (type == TRB_NORMAL) capacity += trb[2] & 0x1ffff;
+            if (!(trb[3] & 0x10)) break;
+        }
+        if (!count || (parts[count - 1].trb[3] & 0x10)) break;
+        size_t length = capacity ? hv_uvc_payload(x->camera, x->camera_payload, capacity) : 0;
+        if (capacity && !length) break;
+        *endpoint = next;
+        uint32_t sent = 0;
+        bool short_packet = false, reported = false;
+        for (unsigned i = 0; i < count; i++) {
+            uint32_t *trb = parts[i].trb;
+            int type = (trb[3] >> 10) & 0x3f;
+            bool ioc = (trb[3] & 0x20) != 0;
+            if (type == TRB_EVENT_DATA) {
+                if (ioc && !reported) {
+                    transfer_data_event(x, trb, short_packet ? CC_SHORT_PACKET : CC_SUCCESS, sent, slot, DEVICE_DCI_IN);
+                    reported = true;
+                }
+                continue;
+            }
+            if (type != TRB_NORMAL) continue;
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t bytes = (uint32_t)(length - sent);
+            if (bytes > want) bytes = want;
+            if (bytes) wr(x, (uint64_t)trb[1] << 32 | trb[0], x->camera_payload + sent, bytes);
+            sent += bytes;
+            short_packet |= bytes < want;
+            if (!reported && (ioc || (short_packet && (trb[3] & 4)))) {
+                transfer_event(x, parts[i].pa, short_packet ? CC_SHORT_PACKET : CC_SUCCESS, want - bytes, slot, DEVICE_DCI_IN);
+                reported = true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&x->mu);
+}
+
 /* Give waiting key reports to the interrupt IN endpoint's posted transfers. */
 static void run_ep_in(HvXhci *x) {
-    int slot = x->kbd_slot;
-    if (!slot || !x->ep_running[KBD_DCI_IN]) return;
-    HvXhciRing *r = &x->ep[KBD_DCI_IN];
+    int slot = x->device_slot;
+    if (!slot || !x->ep_running[DEVICE_DCI_IN]) return;
+    HvXhciRing *r = &x->ep[DEVICE_DCI_IN];
     uint32_t trb[4];
     uint64_t at;
     pthread_mutex_lock(&x->mu);
@@ -313,7 +408,7 @@ static void run_ep_in(HvXhci *x) {
         wr(x, buf, x->reports[x->rhead % HV_XHCI_REPORTS], n);
         x->rhead++;
         x->delivered++;
-        transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, KBD_DCI_IN);
+        transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, DEVICE_DCI_IN);
     }
     pthread_mutex_unlock(&x->mu);
 }
@@ -344,8 +439,9 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     memcpy(ep0, &e0, 4);
     wr(x, out, slot_ctx, 32);
     wr(x, out + 32, ep0, 32);
-    x->kbd_slot = slot;
+    x->device_slot = slot;
     init_ring_from_ctx(x, slot, 1);
+    if (x->camera && x->m->log && !bsr) fprintf(stderr, "henge: macOS addressed the virtual camera\n");
     return CC_SUCCESS;
 }
 
@@ -410,8 +506,8 @@ static void run_commands(HvXhci *x) {
         }
         case TRB_DISABLE_SLOT:
             if (slot >= 1 && slot <= HV_XHCI_SLOTS) x->slot_used[slot] = 0;
-            if (slot == x->kbd_slot) {
-                x->kbd_slot = 0;
+            if (slot == x->device_slot) {
+                x->device_slot = 0;
                 memset(x->ep_running, 0, sizeof x->ep_running);
             }
             break;
@@ -433,6 +529,7 @@ static void run_commands(HvXhci *x) {
         case TRB_RESET_EP: {
             int dci = (trb[3] >> 16) & 0x1f;
             set_ep_state(x, slot, dci, 3); /* stopped */
+            if (x->camera && x->m->log && dci == 1) fprintf(stderr, "henge: macOS reset camera control endpoint\n");
             break;
         }
         case TRB_STOP_EP: {
@@ -450,6 +547,7 @@ static void run_commands(HvXhci *x) {
             x->ep[dci].dequeue = p & ~0xfull;
             x->ep[dci].ccs = (int)(p & 1);
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &p, 8);
+            if (x->camera && x->m->log && dci == 1) fprintf(stderr, "henge: macOS advanced camera control ring\n");
             break;
         }
         case TRB_RESET_DEVICE: {
@@ -457,6 +555,7 @@ static void run_commands(HvXhci *x) {
             uint32_t dw3 = (uint32_t)1 << 27; /* default state, address 0 */
             wr(x, out_ctx(x, slot) + 12, &dw3, 4);
             x->configured = 0;
+            if (x->camera) hv_uvc_reset(x->camera);
             break;
         }
         case TRB_NOOP_CMD:
@@ -473,8 +572,10 @@ static void run_commands(HvXhci *x) {
 /* ---- ports ---- */
 
 static void port_connect(HvXhci *x) {
-    x->portsc[0] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+    uint32_t speed = x->camera ? SPEED_HIGH : SPEED_FULL;
+    x->portsc[0] = PORT_PP | PORT_CCS | PORT_CSC | speed << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
     port_event(x, 0);
+    if (x->camera && x->m->log) fprintf(stderr, "henge: virtual camera connected\n");
 }
 
 static void port_write(HvXhci *x, int p, uint32_t v) {
@@ -482,7 +583,7 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
     uint32_t s = x->portsc[p];
     s &= ~(v & PORT_CHANGES); /* write 1 to clear */
     if (v & PORT_PED) s &= ~PORT_PED;
-    if (v & PORT_PR) { /* reset: enabled, in U0 */
+    if ((v & PORT_PR) && (s & PORT_CCS)) { /* reset: enabled, in U0 */
         s = (s & ~(0xfu << PORT_PLS_SHIFT)) | PORT_PED | PORT_PRC;
         x->portsc[p] = s;
         port_event(x, p);
@@ -514,9 +615,11 @@ static void reset(HvXhci *x) {
     for (int i = 0; i < HV_XHCI_INTRS; i++) x->intr[i].pcs = 1;
     memset(x->slot_used, 0, sizeof x->slot_used);
     memset(x->ep_running, 0, sizeof x->ep_running);
-    x->kbd_slot = 0;
+    x->device_slot = 0;
     x->configured = 0;
-    x->portsc[0] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+    x->portsc[0] = PORT_PP;
+    if (x->camera) hv_uvc_reset(x->camera);
+    if (!x->camera || hv_uvc_shared(x->camera)) port_connect(x);
     update_irq(x);
 }
 
@@ -595,7 +698,6 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
         case 0x00:
             if (v & 2) { /* HCRST */
                 reset(x);
-                port_connect(x);
                 x->usbsts |= 1;
                 return;
             }
@@ -667,7 +769,7 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
         if (slot == 0) {
             x->cmd_running = 1;
             run_commands(x);
-        } else if (slot == x->kbd_slot) {
+        } else if (slot == x->device_slot) {
             int dci = (int)(v & 0xff);
             if (dci < 1 || dci >= HV_XHCI_EPS) return;
             /* A doorbell starts a stopped endpoint again (a halted one waits for Reset Endpoint). */
@@ -676,7 +778,10 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
             if (state != 1) set_ep_state(x, slot, dci, 1);
             x->ep_running[dci] = 1;
             if (dci == 1) run_ep0(x, slot);
-            else if (dci == KBD_DCI_IN) run_ep_in(x);
+            else if (dci == DEVICE_DCI_IN) {
+                if (x->camera) run_camera_in(x);
+                else run_ep_in(x);
+            }
         }
     }
 }
@@ -730,14 +835,41 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
 }
 
 void hv_xhci_poll(HvXhci *x) {
-    if (!x || x->rhead == x->rtail) return;
-    run_ep_in(x);
+    if (!x) return;
+    if (!x->camera) {
+        if (x->rhead != x->rtail) run_ep_in(x);
+        return;
+    }
+    bool connected = (x->portsc[0] & PORT_CCS) != 0;
+    bool shared = hv_uvc_shared(x->camera);
+    if (shared && !connected) port_connect(x);
+    if (!shared && connected) {
+        x->portsc[0] = (x->portsc[0] & PORT_PP) | PORT_CSC;
+        hv_uvc_reset(x->camera);
+        x->camera_requests = 0;
+        port_event(x, 0);
+        if (x->m->log) fprintf(stderr, "henge: virtual camera disconnected\n");
+    }
+    if (shared) run_camera_in(x);
 }
 
-HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+void hv_xhci_camera_share(HvXhci *x, bool enabled) {
+    pthread_mutex_lock(&x->mu);
+    if (hv_uvc_shared(x->camera) != enabled) hv_uvc_share(x->camera, enabled);
+    if (!enabled) memset(x->camera_payload, 0, sizeof x->camera_payload);
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+static HvXhci *create(HvMachine *m, HvPcie *bus, HvUvc *camera) {
     HvXhci *x = calloc(1, sizeof *x);
+    if (!x) return NULL;
     x->m = m;
-    pthread_mutex_init(&x->mu, NULL);
+    x->camera = camera;
+    if (pthread_mutex_init(&x->mu, NULL) != 0) {
+        free(x);
+        return NULL;
+    }
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
     x->pci.opaque = x;
@@ -747,9 +879,20 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     x->pci.config[0x60] = 0x30; /* SBRN: USB 3.0 controller */
     x->pci.config[0x61] = 0x20; /* FLADJ default */
     if (hv_pcie_attach(bus, &x->pci) < 0) {
+        pthread_mutex_destroy(&x->mu);
         free(x);
         return NULL;
     }
     reset(x);
+    return x;
+}
+
+HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) { return create(m, bus, NULL); }
+
+HvXhci *hv_xhci_create_camera(HvMachine *m, HvPcie *bus) {
+    HvUvc *camera = hv_uvc_create();
+    if (!camera) return NULL;
+    HvXhci *x = create(m, bus, camera);
+    if (!x) hv_uvc_destroy(camera);
     return x;
 }

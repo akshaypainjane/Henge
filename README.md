@@ -52,6 +52,12 @@ Do this once for each Mac: open Terminal on the Mac, then in Henge open Details 
 
 Then a Henge folder in the Mac's home folder is the same folder as Files › Henge › Shared. Use the paste button to type supported characters from the device into the Mac. If you previously installed the clipboard helper, run the setup command again to update it to the folder-only helper.
 
+## iPad camera (experimental)
+
+With the Mac running, open Henge’s **Details → iPad Camera → Share Front Camera** and allow iPadOS camera access. Open Photo Booth in macOS and choose **iPad Camera** from its **Camera** menu if needed. The green video button in Henge stops sharing. Leaving Henge or shutting down the guest also stops it.
+
+Henge passes live video in memory to a virtual USB camera. Henge skips saving desktop previews for the rest of a session once camera sharing starts. Guest apps can still take pictures or record video when given access in macOS.
+
 ## Known limits
 
 - Signing in to an Apple Account inside macOS fails with a verification error.

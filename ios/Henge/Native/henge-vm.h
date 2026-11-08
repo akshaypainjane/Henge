@@ -8,7 +8,12 @@
 /* Builds the machine from imported files, on the JIT region the app holds
    (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
-                  int cpus, char *err, size_t errlen);
+                  int cpus, int camera, char *err, size_t errlen);
+int henge_vm_camera_available(void);
+int henge_vm_camera_sharing(void);
+int henge_vm_camera_frame_rate(void);
+int henge_vm_camera_share(int enabled);
+void henge_vm_camera_frame(const uint8_t *y, size_t y_stride, const uint8_t *uv, size_t uv_stride);
 /* Installs macOS from an IPSW onto a new machine (blank disk and auxiliary
    storage): boots the ROM in DFU mode and runs the restore over its USB port,
    as Virtualization.framework's installer does. workdir is scratch space.
