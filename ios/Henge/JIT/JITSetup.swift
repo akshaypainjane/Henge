@@ -132,7 +132,10 @@ final class JITCoordinator: ObservableObject {
     static let shared = JITCoordinator()
 
     @Published var method: JITMethod {
-        didSet { UserDefaults.standard.set(method.rawValue, forKey: "henge.jitMethod") }
+        didSet {
+            if method != oldValue { cancelVPNHandoff() }
+            UserDefaults.standard.set(method.rawValue, forKey: "henge.jitMethod")
+        }
     }
     @Published var showSetup = false
     @Published private(set) var connectionProblem: JITConnectionProblem?
@@ -209,18 +212,50 @@ final class JITCoordinator: ObservableObject {
     static let trollStoreAutoKey = "henge.jit.trollStoreAuto"
     static var trollStoreAuto: Bool { UserDefaults.standard.object(forKey: trollStoreAutoKey) as? Bool ?? true }
 
-    /// JIT at launch opened LocalDevVPN to connect it; the next return to the foreground goes on with the built-in helper.
-    private var awaitingVPN = false
+    private var vpnRequest: UUID?
+    private var vpnHandoff: Task<Void, Never>?
+
+    private func cancelVPNHandoff() {
+        vpnHandoff?.cancel()
+        vpnHandoff = nil
+        vpnRequest = nil
+    }
+
+    private func connectVPNForLaunch() {
+        let request = UUID()
+        vpnRequest = request
+        LocalDevVPN.open { [weak self] opened in
+            guard let self, self.vpnRequest == request else { return }
+            guard opened else {
+                self.cancelVPNHandoff()
+                self.log("JIT at launch: LocalDevVPN could not be opened")
+                return
+            }
+            self.vpnHandoff = Task { [weak self] in
+                let clock = ContinuousClock()
+                let deadline = clock.now.advanced(by: .seconds(30))
+                while clock.now < deadline {
+                    guard let self, self.vpnRequest == request else { return }
+                    if JITBootstrap.ready || !self.hasPairing || !UserDefaults.standard.bool(forKey: Self.autoEnableKey) {
+                        self.cancelVPNHandoff()
+                        return
+                    }
+                    if UIApplication.shared.applicationState == .active && LocalDevVPN.isConnected {
+                        self.cancelVPNHandoff()
+                        self.log("JIT at launch: LocalDevVPN is connected")
+                        self.enableBuiltIn()
+                        return
+                    }
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                }
+                guard let self, self.vpnRequest == request else { return }
+                self.cancelVPNHandoff()
+                self.log("JIT at launch: LocalDevVPN handoff timed out")
+            }
+        }
+    }
 
     func enableAtLaunchIfAsked() {
-        if awaitingVPN {
-            awaitingVPN = false
-            guard !JITBootstrap.ready else { return }
-            log("back from LocalDevVPN (\(LocalDevVPN.isConnected ? "connected" : "not connected")): turning JIT on with built-in StikJIT")
-            method = .builtIn
-            enable()
-            return
-        }
         if !autoTried, JITBootstrap.isInstalledWithTrollStore, Self.trollStoreAuto {
             autoTried = true
             guard !JITBootstrap.ready else { return }
@@ -236,20 +271,17 @@ final class JITCoordinator: ObservableObject {
             log("JIT at launch is on, but built-in StikJIT is not available or not paired; skipped")
             return
         }
-        // The helper reaches this device through LocalDevVPN. When it is not connected, connect it first: LocalDevVPN
-        // connects and comes back (henge://), and the return to the foreground goes on above.
         if LocalDevVPN.isInstalled, !LocalDevVPN.isConnected {
             log("JIT at launch: LocalDevVPN is not connected; opening it to connect")
-            awaitingVPN = true
-            LocalDevVPN.open()
+            connectVPNForLaunch()
             return
         }
         log("turning JIT on at launch with built-in StikJIT")
-        method = .builtIn
-        enable()
+        enableBuiltIn()
     }
 
     func enable() {
+        cancelVPNHandoff()
         guard !JITBootstrap.ready else { return }
         error = nil
         connectionProblem = nil
@@ -565,10 +597,10 @@ enum LocalDevVPN {
     }
     static var actionTitle: String { isInstalled ? "Connect LocalDevVPN" : "Get LocalDevVPN" }
 
-    @MainActor static func open() {
+    @MainActor static func open(completion: (@MainActor (Bool) -> Void)? = nil) {
         let installed = isInstalled
         HengeLog.log("jit", "LocalDevVPN \(installed ? "connect" : "app-store")")
-        UIApplication.shared.open(installed ? connect : appStore)
+        UIApplication.shared.open(installed ? connect : appStore) { opened in completion?(opened) }
     }
 }
 

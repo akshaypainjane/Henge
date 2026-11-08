@@ -160,14 +160,11 @@ final class HardwareMouse {
     private var speed: Float = 1
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
-    private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
 
     func start() {
         let defaults = UserDefaults.standard
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
-        lastScrollFirst = 0
-        lastScrollSecond = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -213,7 +210,10 @@ final class HardwareMouse {
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
         input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
         input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
-        input.scroll.valueChangedHandler = { [weak self] _, first, second in self?.scrolled(first, second) }
+        var previousScroll: (Float, Float) = (0, 0)
+        input.scroll.valueChangedHandler = { [weak self] _, first, second in
+            self?.scrolled(first, second, previous: &previousScroll)
+        }
     }
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
@@ -240,14 +240,13 @@ final class HardwareMouse {
     /// GameController puts vertical motion on the first axis and horizontal on the second.
     /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
     /// and cap each event to keep a small pad gesture from jumping across a page.
-    private func scrolled(_ first: Float, _ second: Float) {
+    private func scrolled(_ first: Float, _ second: Float, previous: inout (Float, Float)) {
         // GameController reports both axis states when either one changes. On a
         // Magic Keyboard it calls us twice per movement, with one stale axis in
         // each call; sending both values doubles the scroll and adds sideways drift.
-        let verticalChanged = first != lastScrollFirst
-        let horizontalChanged = second != lastScrollSecond
-        lastScrollFirst = first
-        lastScrollSecond = second
+        let verticalChanged = first != previous.0
+        let horizontalChanged = second != previous.1
+        previous = (first, second)
         let mostlyVertical = abs(first) > 2 * abs(second)
         let mostlyHorizontal = abs(second) > 2 * abs(first)
         let verticalRaw = verticalChanged && !mostlyHorizontal ? -first : 0
