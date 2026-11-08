@@ -200,7 +200,7 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 2, 0, 0): { /* a process switch */
         uint64_t old = cpu->ttbr0_el1;
         cpu->ttbr0_el1 = v;
-        if (old != v) cpu->ttbr0_changed_at = mach_absolute_time();
+        if (old != v && cpu->m->stats_interval) cpu->ttbr0_changed_at = mach_absolute_time();
         hv_tlb_switch_user(cpu, old, v);
         hv_ijc_switch(cpu);
         return 0;
@@ -355,10 +355,13 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
         /* BaseADDR is VA[36+shift:shift], sign-extended so TTBR1 ranges come out as kernel VAs. */
         uint64_t va = shift ? (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - shift)) : 0;
         uint64_t len = shift ? pages << shift : 0;
-        if (!shift || len > (256ull << HV_TLB_PAGE_BITS)) {
-            /* Reserved granule: everything. A big range: what of that half lies in it. */
-            if (!shift) cpu->m->stats.flush_why[6]++, hv_tlb_flush(cpu);
-            else if ((va >> 55) & 1) hv_tlb_flush_kernel_range(cpu, va, len);
+        /* The targeted paths operate on one address half. A range may end on
+           the boundary. If it crosses it, conservatively invalidate both. */
+        if (!shift || len > (1ull << 55) - (va & ((1ull << 55) - 1))) {
+            cpu->m->stats.flush_why[6]++;
+            hv_tlb_flush(cpu);
+        } else if (len > (256ull << HV_TLB_PAGE_BITS)) {
+            if ((va >> 55) & 1) hv_tlb_flush_kernel_range(cpu, va, len);
             else {
                 hv_tlb_flush_user_range(cpu, va, len);
                 hv_tlb_stash_drop(cpu, all_asids ? -1 : (int)(xt >> 48));
@@ -366,9 +369,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
                 hv_ijc_drop_range(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
             }
         } else {
-            uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-            for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
-                hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : (int)(xt >> 48));
+            hv_tlb_flush_range_pages(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
         }
         return;
     }
@@ -385,17 +386,8 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
         if (cpu->m->log >= 2)
             fprintf(stderr, "tlbi-all S1_%u_C%u_C%u_%u pc %llx\n", op1, crn, crm, op2, (unsigned long long)pc);
         cpu->m->stats.flush_why[crm == 7 ? 0 : 1]++;
-        uint64_t since_switch = crm == 7 ? mach_absolute_time() - cpu->ttbr0_changed_at : ~0ull; /* 24 MHz ticks */
-        /* HV_SWITCH_FLUSH=1 (testing): macOS 27's xnu follows a process switch between two shared regions with a
-           local TLBI VMALLE1, to drop the old region's global entries. Here every process's user entries are put
-           aside under its own TTBR0 and its cached branch targets under its own ASID, so nothing of the old one
-           can be seen; such a flush, within 20 us of a TTBR0 change, is left out. */
-        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] && since_switch < 480) {
-            if (cpu->m->stats_interval) cpu->m->stats.flush_skipped++;
-            return;
-        }
         if (crm == 7 && cpu->m->stats_interval) {
-            uint64_t dt = since_switch;
+            uint64_t dt = mach_absolute_time() - cpu->ttbr0_changed_at; /* 24 MHz ticks */
             cpu->m->stats.flush_after_switch[dt < 48 ? 0 : dt < 480 ? 1 : dt < 4800 ? 2 : 3]++;
             for (int i = 0; i < 8 && dt < 480; i++) { /* where the ones right after a switch come from */
                 uint64_t *slot_pc = &cpu->m->stats.flush_pc[i].pc;

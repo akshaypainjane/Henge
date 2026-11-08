@@ -242,6 +242,38 @@ int main(void) {
         }
     }
 
+    /* Ranges ending exactly at the top of the address space exercise the small
+       range path, the kernel page loop, and the kernel table scan. */
+    {
+        static const struct { unsigned scale, num; } ranges[] = {{0, 2}, {1, 7}, {2, 2}};
+        for (size_t r = 0; r < sizeof ranges / sizeof ranges[0]; r++) {
+            uint64_t length = ((uint64_t)(ranges[r].num + 1) << (5 * ranges[r].scale + 1)) << 14;
+            uint64_t base = 0 - length;
+            const uint64_t addresses[] = {base - 0x4000, base, base + 0x4000, UINT64_MAX - 0x3fff};
+            cpu.el = 1;
+            for (size_t k = 0; k < sizeof addresses / sizeof addresses[0]; k++) {
+                uint64_t va = addresses[k];
+                HvTlbEntry *e = hv_tlb_ent(&cpu, (va >> 14) & (HV_TLB_SIZE - 1), 1);
+                e->read_tag = va - HV_TLB_ADJ;
+                e->addend = 0;
+            }
+            cpu.x[1] = 2ull << 46 | (uint64_t)ranges[r].scale << 44 | (uint64_t)ranges[r].num << 39 |
+                       ((base >> 14) & 0x1fffffffffull);
+            hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
+            for (size_t k = 0; k < sizeof addresses / sizeof addresses[0]; k++) {
+                uint64_t va = addresses[k];
+                HvTlbEntry *e = hv_tlb_ent(&cpu, (va >> 14) & (HV_TLB_SIZE - 1), 1);
+                checks++;
+                if ((e->read_tag == HV_TLB_INVALID) != (k != 0)) {
+                    printf("  FAIL top-of-address-space TLBI: range %llu, page %llx\n",
+                           (unsigned long long)length, (unsigned long long)va);
+                    failures++;
+                }
+                memset(e, 0x80, sizeof *e);
+            }
+        }
+    }
+
     /* A TLBI by VA and ASID forgets the indirect-branch cache entries of that page
        for that address space, and nothing else. Entries are filled the way the dispatcher does it. */
     {
