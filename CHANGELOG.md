@@ -4,6 +4,14 @@ This fork collects the fixes from the community forks of [Leviidev/Henge](https:
 into one build, with a few additions, aimed above all at iPad (tested hardware: iPad Pro M4).
 Every change keeps its original author in the git history.
 
+## Fork changes
+
+- TLB range invalidation covers the final guest page without dropping unrelated translations.
+- Guest settings are applied at startup. Details shows effective RAM and reports incomplete GPU work.
+  The app reads performance preferences from Settings.
+- Synchronized disk flushes are the default. Optional write barriers fall back to synchronization if unavailable.
+- Automation and raw graphics capture are development tools. The iPad camera cannot be shared during a frame-capture run.
+
 ## 0.2.0 (100)
 
 Based on upstream `main` at b744a78.
@@ -49,7 +57,7 @@ Based on upstream `main` at b744a78.
   - *Faster disk writes* (on): `F_BARRIERFSYNC` instead of a full `fsync`.
   - *Quicker wake from idle* (off): an idle CPU watches for work for 50 µs before sleeping.
   - *Superblocks (experimental)* (off): translated code runs on past conditional branches.
-  - `Documents/henge-env.txt` still overrides everything.
+  - `Documents/henge-env.txt` overrides were available in 0.2.0.
 - **Hide the session controls**: a button left of Keyboard hides the bar over the Mac; a
   three-finger tap brings it back (a hint says so the first three times). iPadOS's own
   three-finger undo/copy/paste bar is turned off inside the session so it doesn't interfere.

@@ -47,6 +47,7 @@
 
 struct HvPvgLite {
     uint32_t refresh_hz;
+    _Atomic uint64_t failed_gpu_batches;
     HvMachine *m;
     HvGic *gic;
     int gfx_irq, iosfc_irq;
@@ -384,6 +385,14 @@ void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
 
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
     return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
+}
+
+void hv_pvg_lite_note_gpu_failure(HvPvgLite *p) {
+    atomic_fetch_add_explicit(&p->failed_gpu_batches, 1, memory_order_relaxed);
+}
+
+uint64_t hv_pvg_lite_gpu_failures(HvPvgLite *p) {
+    return p ? atomic_load_explicit(&p->failed_gpu_batches, memory_order_relaxed) : 0;
 }
 
 int hv_pvg_lite_frame_diagnostics_enabled(void) { return hv_pvg_frame_diagnostics_enabled(); }
@@ -755,6 +764,7 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
     HvPvgLite *p = calloc(1, sizeof *p);
     p->layer_lock = OS_UNFAIR_LOCK_INIT;
     atomic_init(&p->metal, NULL);
+    atomic_init(&p->failed_gpu_batches, 0);
     p->m = m;
     p->gic = gic;
     p->gfx_irq = gfx_irq;

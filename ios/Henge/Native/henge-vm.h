@@ -71,6 +71,7 @@ int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 void henge_vm_set_display_layer(void *layer);
 /// How many frames have gone to it.
 uint64_t henge_vm_gpu_frames(void);
+uint64_t henge_vm_gpu_failures(void);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
 
 /* The largest single mapping the address space takes right now, in MB (the

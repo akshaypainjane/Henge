@@ -14,6 +14,7 @@ struct SessionView: View {
     @State private var state: Int32 = 0
     @State private var cpusOn: Int32 = 0
     @State private var guestRAMMiB: UInt64 = 0
+    @State private var gpuFailures: UInt64 = 0
     @State private var userCode = false
     @State private var blocksPerSecond: Double = 0
     @State private var framesOut: UInt64 = 0
@@ -468,6 +469,11 @@ struct SessionView: View {
                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                 }
                 Section("Display") {
+                    if gpuFailures > 0 {
+                        LabeledContent("GPU compatibility", value: "\(gpuFailures) incomplete batches")
+                        Text("Some graphics or video effects may render incorrectly.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     Toggle("Color matching", isOn: $matchScreenColors)
                     LabeledContent("Brightness", value: "\(Int(screenBrightness * 100))%")
                     Slider(value: $screenBrightness, in: 0.4...1)
@@ -623,7 +629,10 @@ struct SessionView: View {
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
             if localSSHStatus >= 0 { localSSHStatus = henge_vm_local_ssh_status() }
-            if showDetails { log = Array(HengeLog.recentLines(200)) }
+            if showDetails {
+                gpuFailures = henge_vm_gpu_failures()
+                log = Array(HengeLog.recentLines(200))
+            }
             let heat = ProcessInfo.processInfo.thermalState
             if heat.rawValue != thermalState.rawValue {
                 thermalState = heat

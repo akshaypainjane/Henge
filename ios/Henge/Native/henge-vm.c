@@ -195,6 +195,10 @@ uint64_t henge_vm_gpu_frames(void) {
     return hv_vm_gpu_frames();
 }
 
+uint64_t henge_vm_gpu_failures(void) {
+    return state ? hv_pvg_lite_gpu_failures(hv_vm_board()->pvg) : 0;
+}
+
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
     HvBootDisplay d;
     if (!state || hv_vm_boot_display(&d) != 0) return -1;

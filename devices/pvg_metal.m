@@ -148,7 +148,7 @@ static uint64_t page_aligned_length(uint64_t first, uint64_t bytes) {
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
-    uint64_t execs, draws, failed, heap_bytes, synced, remaps, next_object_id;
+    uint64_t execs, draws, heap_bytes, synced, remaps, next_object_id;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
@@ -1106,7 +1106,7 @@ static BOOL has_guest_pages(HvObject *o) {
     }
     [blit endEncoding];
     if (cb) {
-        [self commit:cb channel:0 stamp:0 complete:NO];
+        [self commit:cb channel:0 stamp:0 complete:NO failed:NO];
         synced++;
     }
 }
@@ -1619,8 +1619,11 @@ static void read_record(Rec r, uint32_t offset, void *out, size_t bytes) {
 }
 
 /* Compute calls. Tags start at 200. */
-- (void)compute:(id<MTLComputeCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
-    if (!pipeline_set && (tag == 200 || tag == 202)) return;
+- (BOOL)compute:(id<MTLComputeCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    if (!pipeline_set && (tag == 200 || tag == 202)) {
+        [self complain:@"compute dispatch skipped: pipeline unavailable"];
+        return NO;
+    }
     switch (tag) {
     case 209: {
         MTLRegion region;
@@ -1707,6 +1710,7 @@ static void read_record(Rec r, uint32_t offset, void *out, size_t bytes) {
         [self complain:[NSString stringWithFormat:@"compute command %u (%u bytes) skipped", tag, r.size]];
         break;
     }
+    return YES;
 }
 
 static BOOL texture_region_fits(id<MTLTexture> tex, uint16_t slice, uint16_t level,
@@ -1934,16 +1938,19 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
 
 /* One exec: {task, resources, buffers}, {ref, flags} per resource, {offset, length} per buffer. */
 /* Commits without waiting: the next batch can be encoded while the GPU does this one. */
-- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete {
+- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp
+      complete:(BOOL)complete failed:(BOOL)encodingFailed {
     static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
     if (sync < 0) sync = hv_pvg_diagnostic_env("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
     atomic_fetch_add(&inflight, 1);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (encodingFailed || done.error) hv_pvg_lite_note_gpu_failure(l);
         if (done.error) {
-            self->failed++;
             fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
         }
+        /* The stamp retires the batch. The guest protocol has no verified
+           per-batch error result, so keep progress and report failures locally. */
         if (complete) hv_pvg_lite_complete(l, ch, stamp);
         atomic_fetch_sub(&self->inflight, 1);
     }];
@@ -1958,7 +1965,12 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
         hv_pvg_lite_complete(lite, ch, stamp);
         return;
     }
-    [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES];
+    id<MTLCommandBuffer> marker = [queue commandBuffer];
+    if (marker) [self commit:marker channel:ch stamp:stamp complete:YES failed:NO];
+    else {
+        [last_cb waitUntilCompleted];
+        hv_pvg_lite_complete(lite, ch, stamp);
+    }
 }
 
 /* Returns YES if the GPU's completion gives the stamp back. */
@@ -1966,6 +1978,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
     uint32_t task = a[0], nres = a[1], nbuf = a[2];
     if (12 + nres * 8ull + nbuf * 16ull > len) { /* never quietly: a lost job is a frame that never gets drawn */
         [self complain:[NSString stringWithFormat:@"exec of %u bytes dropped: task %u, %u resources, %u buffers", len, task, nres, nbuf]];
+        hv_pvg_lite_note_gpu_failure(lite);
         return NO;
     }
     const uint32_t *res = a + 3;
@@ -1977,6 +1990,11 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
     if (tracing) fprintf(stderr, "trace: exec task %u, %u resources, %u buffers\n", task, nres, nbuf);
     double t_begin = now_seconds();
     id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (!cb) {
+        [self complain:@"could not allocate a Metal command buffer"];
+        hv_pvg_lite_note_gpu_failure(lite);
+        return NO;
+    }
     id<MTLBlitCommandEncoder> blit = nil;
     BOOL sync_after = NO;
     for (uint32_t i = 0; i < nres; i++) {
@@ -2013,6 +2031,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
                 }
             }
         }
+    BOOL encodingFailed = NO;
     id e = nil; /* the open encoder */
     uint32_t etype = 0;
     for (uint32_t b = 0; b < nbuf; b++) {
@@ -2068,14 +2087,14 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
                     pipeline_set = NO, tess_factors = NO;
                 } else if (e) {
                     if (etype == 0) [self render:e tag:tag rec:r task:task];
-                    else if (etype == 1) [self compute:e tag:tag rec:r task:task];
+                    else if (etype == 1) encodingFailed |= ![self compute:e tag:tag rec:r task:task];
                     else [self blit:e tag:tag rec:r task:task];
                 }
                 p += size;
             }
         } @catch (NSException *x) {
             [self complain:[NSString stringWithFormat:@"exception: %@", x.reason]];
-            failed++;
+            encodingFailed = YES;
         }
         if (!more && e) { [e endEncoding]; e = nil; }
     }
@@ -2092,7 +2111,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
         [back endEncoding];
     }
     double t1 = now_seconds();
-    [self commit:cb channel:ch stamp:stamp complete:!written_planes];
+    [self commit:cb channel:ch stamp:stamp complete:!written_planes failed:encodingFailed];
     if (written_planes) {
         [cb waitUntilCompleted];
         if (cb.status == MTLCommandBufferStatusCompleted)
@@ -2104,7 +2123,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed batches, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)hv_pvg_lite_gpu_failures(lite), (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
         encode_time = gpu_wait_time = 0;
     }
     return YES;
