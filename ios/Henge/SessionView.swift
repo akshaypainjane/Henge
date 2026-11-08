@@ -1,5 +1,6 @@
 import SwiftUI
 import GameController
+import UIKit
 
 /// A running Mac. Upright, its screen sits above a trackpad; on its side the screen fills the device
 /// and is its own trackpad. Zoomed in, the screen fills the device either way and follows the pointer.
@@ -38,6 +39,7 @@ struct SessionView: View {
     @State private var showDetails = false
     @State private var controlsHidden = false
     @State private var showRevealHint = false
+    @State private var showPasteUnavailable = false
     @State private var pointerRefused = false
     @AppStorage("henge.controls.hintsShown") private var revealHintsShown = 0
     @State private var confirmStop = false
@@ -136,6 +138,11 @@ struct SessionView: View {
         .persistentSystemOverlays(.hidden)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showDetails) { details }
+        .alert("Couldn’t Paste", isPresented: $showPasteUnavailable) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Copy text on your iPad and allow Henge to paste if prompted.")
+        }
         .confirmationDialog("Shut down \(mac.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
             Button("Shut Down", role: .destructive) { finish() }
         } message: {
@@ -316,17 +323,18 @@ struct SessionView: View {
             .font(.system(size: 15))
     }
 
-    /// The system's paste button: iOS asks no permission for it, as it would if the app read the clipboard itself.
     private var pasteTool: some View {
-        PasteButton(payloadType: String.self) { texts in
-            guard let text = texts.first else { return }
+        tool("clipboard", "Paste from iPad") {
+            // Read only on tap. iPadOS can ask before granting access to text from another app.
+            guard let text = UIPasteboard.general.string, !text.isEmpty else {
+                showPasteUnavailable = true
+                return
+            }
             // This types keys rather than pasting text. Never synthesize Return or Tab from a paste.
             let singleLine = String(text.map { $0.isNewline || $0 == "\t" ? " " : $0 })
             Task { await Keys.typeSlowly(singleLine) }
         }
-        .labelStyle(.iconOnly)
-        .buttonBorderShape(.circle)
-        .tint(Desk.raised)
+        .disabled(state != 1)
     }
 
     /// Hides the session's controls; three fingers on the screen bring them back. The first few times say so.
