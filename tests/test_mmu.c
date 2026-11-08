@@ -63,6 +63,18 @@ static void expect(const char *what, HvCpu *cpu, uint64_t va, HvAccess acc, int 
     }
 }
 
+static void expect_branch_target(const char *what, HvCpu *cpu, uint64_t va, uintptr_t expected) {
+    uint64_t tag = va ^ cpu->ijc_salt[0];
+    const uint64_t *ways = cpu->pc_state->ijc + (size_t)hv_ijc_index(tag) * 2;
+    uint64_t code = ways[0] == tag ? ways[1] : ways[2] == tag ? ways[3] : 0;
+    checks++;
+    if (code != expected) {
+        printf("  FAIL %s: branch target %llx, expected %llx\n", what,
+               (unsigned long long)code, (unsigned long long)expected);
+        failures++;
+    }
+}
+
 int main(void) {
     static HvMachine m;
     static HvCpu cpu;
@@ -313,6 +325,46 @@ int main(void) {
             printf("  FAIL an all-ASID TLBI kept the entry\n");
             failures++;
         }
+    }
+
+    /* Two address spaces can reuse an ASID. A TTBR0 write alone must not
+       leave the old address space's translated target visible at the same VA. */
+    {
+        hv_cpu_reset(&cpu, &m);
+        cpu.el = 1;
+        cpu.tcr_el1 = 0;
+        const uint64_t table_a = 7ull << 48 | 0x4000, table_b = 7ull << 48 | 0x8000;
+        cpu.x[0] = table_a;
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0); /* msr ttbr0_el1, x0 */
+        HvBlock target = {.va = 0x100004010ull, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &target);
+
+        cpu.x[0] = table_a | 1; /* the CnP bit does not change the table */
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("same ASID and table", &cpu, target.va, 0x1234);
+        cpu.x[0] = 8ull << 48 | 0x4000;
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("different ASID and same table", &cpu, target.va, 0);
+        cpu.x[0] = table_a;
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("return to cached ASID and table", &cpu, target.va, 0x1234);
+
+        cpu.x[0] = table_b;
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("same ASID with a new table", &cpu, target.va, 0);
+        target.code = (uint32_t *)(uintptr_t)0x5678;
+        hv_ijc_fill(&cpu, &target);
+        expect_branch_target("new table's target", &cpu, target.va, 0x5678);
+
+        cpu.x[0] = table_b | (uint64_t)HV_ASID_TAGS << 48; /* same tag slot, different ASID */
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("colliding ASID", &cpu, target.va, 0);
+        cpu.x[0] = table_b;
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("return after a tag collision", &cpu, target.va, 0);
+        cpu.x[0] = table_a;
+        hv_sysreg_msr(&cpu, 0xd5182000u, 0);
+        expect_branch_target("return to the original table", &cpu, target.va, 0);
     }
 
     printf("%d checks, %d failures\n", checks, failures);

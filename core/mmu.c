@@ -257,11 +257,18 @@ void hv_ijc_switch(HvCpu *cpu) {
         cpu->ijc_salt[0] = (uint64_t)fresh_cid(cpu) << 48;
         return;
     }
-    if (!cpu->asid_cid[asid]) {
-        cpu->asid_cid[asid] = fresh_cid(cpu);
-        cpu->cid_asid[cpu->asid_cid[asid]] = (uint16_t)asid;
-        if (cpu->nasid_log < HV_ASID_LOG) cpu->asid_log[cpu->nasid_log] = (uint16_t)asid;
-        if (cpu->nasid_log <= HV_ASID_LOG) cpu->nasid_log++;
+    uint64_t ttbr0 = cpu->ttbr0_el1 & ~1ull; /* CnP does not change the table or ASID */
+    uint64_t *tag = &cpu->asid_ttbr0[asid & (HV_ASID_TAGS - 1)];
+    if (!cpu->asid_cid[asid] || *tag != ttbr0) {
+        /* A different table under this ASID, or a tag collision, needs a new id. */
+        uint16_t cid = fresh_cid(cpu);
+        if (!cpu->asid_cid[asid]) { /* fresh_cid can clear the old ids and the log */
+            if (cpu->nasid_log < HV_ASID_LOG) cpu->asid_log[cpu->nasid_log] = (uint16_t)asid;
+            if (cpu->nasid_log <= HV_ASID_LOG) cpu->nasid_log++;
+        }
+        *tag = ttbr0;
+        cpu->asid_cid[asid] = cid;
+        cpu->cid_asid[cid] = (uint16_t)asid;
     }
     cpu->ijc_salt[0] = (uint64_t)cpu->asid_cid[asid] << 48;
 }

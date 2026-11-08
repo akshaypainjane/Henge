@@ -141,12 +141,12 @@ typedef struct HvCpu {
     uint32_t nasid_log;
     /* Indirect-branch cache salts live in bits 63..48, which no user VA sets and
        every kernel VA has all ones in, so each salt value names a distinct set
-       of tags. User salts are per ASID (asid_cid[ASID], 0 = none yet), so a
-       process switch keeps every process's entries; dropping one means giving
-       its ASID a fresh id. Ids only grow until they run out, then the tables
-       are cleared. */
+       of tags. A user salt (asid_cid[ASID], 0 = none yet) can be reused only
+       for the same TTBR0. Ids grow until they run out, then the tables are cleared. */
+#define HV_ASID_TAGS 512
     uint16_t asid_cid[65536];
     uint16_t cid_asid[65536]; /* --stats: the ASID a user id was given to (to tell live tags from dead ones) */
+    uint64_t asid_ttbr0[HV_ASID_TAGS]; /* direct-mapped validation tags, including the ASID */
     uint32_t next_cid, kernel_gen;
     uint64_t ttbr0_changed_at; /* --stats: host time of the last TTBR0 change */
 
