@@ -130,13 +130,6 @@ enum Keys {
         if shifted { henge_vm_key(shift, 0) }
     }
 
-    /// A letter (or space) with a modifier held.
-    static func chord(_ modifier: UInt16, _ c: Character) {
-        henge_vm_key(modifier, 1)
-        type(c)
-        henge_vm_key(modifier, 0)
-    }
-
     /// One character at a time, for what the Mac has to keep up with.
     @MainActor static func typeSlowly(_ text: String) async {
         for c in text {

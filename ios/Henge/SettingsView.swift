@@ -6,6 +6,8 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
 
+    @AppStorage(Sharing.enabledKey) private var shareFiles = false
+
     var body: some View {
         NavigationStack {
             Form {
@@ -43,6 +45,12 @@ struct SettingsView: View {
                     }
                     .listRowBackground(Desk.card)
                 }
+                Section("Sharing") {
+                    Toggle("Share files with macOS", isOn: $shareFiles)
+                    Text("Gives the virtual Mac read and write access to Files › Henge › Shared. Changes apply the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
                 Section("Log") {
                     ShareLink(item: HengeLog.logFileURL) { Label("Share henge.log", systemImage: "square.and.arrow.up") }
                 }

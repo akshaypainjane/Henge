@@ -18,6 +18,8 @@ struct SessionView: View {
     @State private var log: [String] = []
     @State private var started = Date()
     @AppStorage("henge.cpus") private var cpus = 4
+    @AppStorage(Sharing.enabledKey) private var shareFiles = false
+    @State private var sharingActive = false
 
     @State private var typing = false
     @State private var zoomed = false
@@ -26,7 +28,6 @@ struct SessionView: View {
     @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
-    @State private var helperRunning = false
     @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
     @Environment(\.scenePhase) private var scenePhase
 
@@ -118,7 +119,6 @@ struct SessionView: View {
         }
         .modifier(ExternalMacDisplayModifier(display: display, aspect: mac.aspect))
         .task { await run() }
-        .task { await Sharing.followMacClipboard() }
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -258,7 +258,10 @@ struct SessionView: View {
     /// The system's paste button: iOS asks no permission for it, as it would if the app read the clipboard itself.
     private var pasteTool: some View {
         PasteButton(payloadType: String.self) { texts in
-            if let text = texts.first { Sharing.paste(text) }
+            guard let text = texts.first else { return }
+            // This types keys rather than pasting text. Never synthesize Return or Tab from a paste.
+            let singleLine = String(text.map { $0.isNewline || $0 == "\t" ? " " : $0 })
+            Task { await Keys.typeSlowly(singleLine) }
         }
         .labelStyle(.iconOnly)
         .buttonBorderShape(.circle)
@@ -383,8 +386,7 @@ struct SessionView: View {
                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                 }
                 Section("Sharing") {
-                    LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
-                    if !helperRunning {
+                    if sharingActive {
                         Button("Type the Set Up Command") {
                             showDetails = false
                             Task {
@@ -392,11 +394,12 @@ struct SessionView: View {
                                 await Sharing.typeSetUpCommand()
                             }
                         }
+                        Text("Open Terminal in the Mac, tap this button, then press Return. Allow local network access for henge-agent if asked. The Mac needs a U.S. keyboard layout. The helper mounts Files › Henge › Shared in your Mac's home folder.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } else {
+                        Text(shareFiles ? "The Shared folder could not be opened." : "To share files, turn on sharing in Settings before starting the Mac.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
-                    Text(helperRunning
-                         ? "Put files in Files, Henge, Shared to see them in the Henge folder in this Mac's home folder. What you copy on the Mac is copied here too, and the paste button pastes from here into the Mac."
-                         : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
-                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Log") {
                     VStack(alignment: .leading, spacing: 1) {
@@ -422,7 +425,7 @@ struct SessionView: View {
             return
         }
         var buffer = [CChar](repeating: 0, count: 256)
-        Sharing.prepare()
+        sharingActive = Sharing.prepare(enabled: shareFiles)
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
         if rc != 0 {
@@ -446,7 +449,6 @@ struct SessionView: View {
             lastTime = now
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
-            helperRunning = Sharing.helperRunning
             log = Array(HengeLog.recentLines(200))
             if state == 2 { break }
             tick += 1

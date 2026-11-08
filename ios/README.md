@@ -43,9 +43,8 @@ libslirp and glib for iOS).
   the session while connected. These individual lifecycle cases, other devices
   and AirPlay have not been separately verified.
 - **Sharing** (`Henge/Sharing.swift`, `host/share.c`,
-  [docs/architecture.md](../docs/architecture.md)): the Shared folder in Files and
-  the clipboard. The Mac's clipboard follows along; going the other way uses the
-  system paste button, since iOS asks permission when an app reads it on its own.
+  [docs/architecture.md](../docs/architecture.md)): the Shared folder in Files. Enable **Settings › Sharing › Share files with macOS** before starting the guest.
+  The system paste button types supported characters into the guest when tapped.
 - **Hardware input** (`Henge/Hardware.swift`): a keyboard's keys go to the Mac's
   USB keyboard by HID usage, which is how iOS reports them. A trackpad or mouse
   goes through GameController with the pointer locked, which iPadOS allows only

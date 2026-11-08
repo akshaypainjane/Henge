@@ -67,13 +67,15 @@ checks the result against a SHA-256 hash. Nothing is decrypted.
 
 ## Sharing
 
+File sharing on iOS is off by default and can be enabled before starting the guest.
 `host/share.c` is a small WebDAV server, because macOS has a WebDAV client built in. The
 guest reaches it at 10.0.2.4, which the user-mode network hands to a Unix socket in the
-app's storage: no TCP port is open, so other apps on the device can't reach it. Under
-`/.henge/` it also has the clipboard and what it takes to install `tools/henge-agent.m`, a
-small helper that runs inside macOS as a LaunchAgent, mounts the folder at `~/Henge` and
-follows the clipboard. The app types the set up command but never presses Return: it can't
-see what has the keyboard on the Mac.
+app's storage: no TCP port is open, so other apps on the device can't reach it.
+The server opens files relative to the shared directory and does not follow symlinks. Under
+`/.henge/` it serves `tools/henge-agent.m`, a helper that runs inside macOS as a
+LaunchAgent and mounts the folder at `~/Henge`. The app types the setup command
+but never presses Return because it cannot tell what has the keyboard on the Mac.
+The paste button sends supported text as single-line keystrokes when tapped.
 
 ## Installing macOS (no Mac needed)
 

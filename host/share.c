@@ -1,11 +1,10 @@
-/* The folder and clipboard a virtual Mac shares with the device it runs on.
+/* The folder a virtual Mac shares with the device it runs on.
 
    The folder is a small WebDAV server, because macOS has a WebDAV client built in, so it mounts like any
    network drive with nothing to install for that part. The network hands each connection the guest makes to
    10.0.2.4:80 to a Unix socket in the app's own storage: no TCP port is open, so other apps can't reach this.
 
-   /.henge/ is not part of the folder. It has the clipboard, where the helper inside macOS (tools/henge-agent.m)
-   waits for the device's clipboard and sends the guest's, and what it takes to install that helper.
+   /.henge/ serves the optional helper (tools/henge-agent.m) that mounts the folder inside macOS.
 
    Locks are accepted but not enforced: macOS only writes to a server that offers them, and there is one client. */
 #include "share.h"
@@ -16,7 +15,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
-#include <removefile.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,50 +23,17 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #define HEAD_MAX (32 * 1024)
-#define SMALL_BODY_MAX (16 * 1024 * 1024) /* a clipboard, or a request's XML */
 #define TEMP_PREFIX ".henge-put-"
 
-static char root[PATH_MAX];
+static int root_fd = -1;
+static char root_path[PATH_MAX];
+static pthread_mutex_t namespace_lock = PTHREAD_MUTEX_INITIALIZER;
 static char agent_path[PATH_MAX];
-
-/* ---- the clipboard ---- */
-
-static pthread_mutex_t clip_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t clip_cond = PTHREAD_COND_INITIALIZER;
-static char *device_clip; /* the device's, for the guest */
-static unsigned long device_seq;
-static char *guest_clip; /* the guest's, until the device takes it */
-static time_t agent_seen;
-
-void hv_share_set_clipboard(const char *text) {
-    pthread_mutex_lock(&clip_mu);
-    free(device_clip);
-    device_clip = strdup(text);
-    device_seq++;
-    pthread_cond_broadcast(&clip_cond);
-    pthread_mutex_unlock(&clip_mu);
-}
-
-char *hv_share_take_clipboard(void) {
-    pthread_mutex_lock(&clip_mu);
-    char *text = guest_clip;
-    guest_clip = NULL;
-    pthread_mutex_unlock(&clip_mu);
-    return text;
-}
-
-long hv_share_agent_seen(void) {
-    pthread_mutex_lock(&clip_mu);
-    long ago = agent_seen ? (long)(time(NULL) - agent_seen) : -1;
-    pthread_mutex_unlock(&clip_mu);
-    return ago;
-}
 
 /* ---- connections ---- */
 
@@ -82,26 +47,33 @@ typedef struct Request {
     char method[16];
     char target[HEAD_MAX]; /* as sent, without the query */
     char path[PATH_MAX];   /* decoded */
-    char query[128];
     char destination[PATH_MAX]; /* decoded path */
     char if_header[256];
     long long length;
     int chunked, expect_continue, close, overwrite, depth;
     long long range_from, range_to; /* -1: none */
     long chunk_left;
-    int body_done;
+    int body_done, chunk_needs_crlf;
 } Request;
 
 /* A growing string for XML. */
 typedef struct Text {
     char *s;
     size_t len, cap;
+    int failed;
 } Text;
 
 static void add(Text *t, const char *s, size_t n) {
+    if (t->failed) return;
     if (t->len + n + 1 > t->cap) {
-        t->cap = (t->len + n + 1) * 2;
-        t->s = realloc(t->s, t->cap);
+        const size_t max = 8 * 1024 * 1024;
+        if (n >= max - t->len) { t->failed = 1; return; }
+        size_t cap = (t->len + n + 1) * 2;
+        if (cap > max) cap = max;
+        char *next = realloc(t->s, cap);
+        if (!next) { t->failed = 1; return; }
+        t->s = next;
+        t->cap = cap;
     }
     memcpy(t->s + t->len, s, n);
     t->len += n;
@@ -173,30 +145,46 @@ static int conn_line(Conn *c, char *line, size_t cap) {
         char ch;
         if (conn_read(c, &ch, 1) != 1) return -1;
         if (ch == '\n') {
-            if (n && line[n - 1] == '\r') n--;
-            line[n] = 0;
+            if (!n || line[n - 1] != '\r') return -1;
+            line[--n] = 0;
             return 0;
         }
+        if (!ch || (n && line[n - 1] == '\r')) return -1;
         line[n++] = ch;
     }
     return -1;
 }
+
+static int hex(int c);
+static int root_is_current(void);
 
 /* The next piece of the request's body: >0 bytes, 0 at its end, <0 if the connection broke. */
 static ssize_t body_read(Conn *c, Request *r, void *out, size_t n) {
     if (r->body_done) return 0;
     if (r->chunked) {
         if (r->chunk_left == 0) {
-            char line[64];
-            if (conn_line(c, line, sizeof line) != 0) return -1;
-            if (!line[0] && conn_line(c, line, sizeof line) != 0) return -1; /* the CRLF ending the last chunk */
-            r->chunk_left = strtol(line, NULL, 16);
-            if (r->chunk_left < 0) return -1;
+            char line[HEAD_MAX];
+            if (r->chunk_needs_crlf && (conn_line(c, line, sizeof line) != 0 || line[0])) return -1;
+            if (conn_line(c, line, sizeof line) != 0 || hex((unsigned char)line[0]) < 0) return -1;
+            const unsigned char *p = (const unsigned char *)line;
+            int digit;
+            while ((digit = hex(*p)) >= 0) {
+                if (r->chunk_left > (LONG_MAX - digit) / 16) return -1;
+                r->chunk_left = r->chunk_left * 16 + digit;
+                p++;
+            }
+            if (*p && *p != ';') return -1;
             if (r->chunk_left == 0) {
-                while (conn_line(c, line, sizeof line) == 0 && line[0]) {} /* trailers */
+                size_t trailers = 0;
+                do {
+                    if (conn_line(c, line, sizeof line) != 0) return -1;
+                    trailers += strlen(line) + 2;
+                    if (trailers > HEAD_MAX) return -1;
+                } while (line[0]);
                 r->body_done = 1;
                 return 0;
             }
+            r->chunk_needs_crlf = 1;
         }
         size_t take = (size_t)r->chunk_left < n ? (size_t)r->chunk_left : n;
         ssize_t got = conn_read(c, out, take);
@@ -232,24 +220,6 @@ static int body_discard(Conn *c, Request *r) {
         if (got == 0) return 0;
         if (got < 0) return -1;
     }
-}
-
-static char *body_small(Conn *c, Request *r, size_t *len) {
-    Text t = {0};
-    char piece[16384];
-    body_ready(c, r);
-    for (;;) {
-        ssize_t got = body_read(c, r, piece, sizeof piece);
-        if (got < 0 || t.len + (size_t)got > SMALL_BODY_MAX) {
-            free(t.s);
-            return NULL;
-        }
-        if (got == 0) break;
-        add(&t, piece, (size_t)got);
-    }
-    add(&t, "", 0);
-    *len = t.len;
-    return t.s;
 }
 
 static int respond(Conn *c, Request *r, int status, const char *reason, const char *headers, const char *body, size_t len) {
@@ -290,19 +260,76 @@ static int decode_path(const char *in, char *out, size_t cap) {
     }
     out[n] = 0;
     if (out[0] != '/') return -1;
-    for (const char *s = out; s; s = strchr(s + 1, '/')) {
-        const char *part = s + 1, *end = strchr(part, '/');
-        size_t len = end ? (size_t)(end - part) : strlen(part);
-        if (len == 2 && part[0] == '.' && part[1] == '.') return -1;
+    /* Use one spelling of the root and refuse traversal and internal staging names. */
+    char *read = out + 1, *write = out + 1;
+    while (*read) {
+        if (*read == '/') { read++; continue; }
+        char *end = strchr(read, '/');
+        size_t len = end ? (size_t)(end - read) : strlen(read);
+        if ((len == 2 && !memcmp(read, "..", 2)) ||
+            (len >= sizeof TEMP_PREFIX - 1 && !strncasecmp(read, TEMP_PREFIX, sizeof TEMP_PREFIX - 1))) return -1;
+        if (!(len == 1 && read[0] == '.')) {
+            if (write != out + 1) *write++ = '/';
+            memmove(write, read, len);
+            write += len;
+        }
+        if (!end) break;
+        read = end + 1;
     }
+    *write = 0;
     return 0;
 }
 
-static int local_path(const char *path, char *out, size_t cap) {
-    int n = snprintf(out, cap, "%s%s", root, path);
-    if (n < 0 || (size_t)n >= cap) return -1;
-    while (n > 1 && out[n - 1] == '/') out[--n] = 0;
-    return 0;
+static int internal_path(const char *path) {
+    return !strncasecmp(path, "/.henge", 7) && (!path[7] || path[7] == '/');
+}
+
+static int shared_type(const struct stat *st) {
+    /* Do not expose symlinks, special files, or hard links into other directories. */
+    return S_ISDIR(st->st_mode) || (S_ISREG(st->st_mode) && st->st_nlink == 1);
+}
+
+static int open_shared(const char *path, struct stat *st) {
+    int fd = openat(root_fd, path[1] ? path + 1 : ".", O_RDONLY | O_NONBLOCK | O_NOFOLLOW_ANY | O_CLOEXEC);
+    if (fd >= 0 && (fstat(fd, st) != 0 || !shared_type(st))) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+typedef struct Parent {
+    int fd;
+    const char *name;
+} Parent;
+
+static void close_parent(Parent *p) { if (p->fd >= 0) close(p->fd); }
+
+static Parent open_parent(const char *path) {
+    Parent p = {.fd = -1};
+    if (!path[1] || internal_path(path)) { errno = EACCES; return p; }
+    const char *last = strrchr(path, '/');
+    char dir[PATH_MAX] = ".";
+    if (last != path) {
+        memcpy(dir, path + 1, (size_t)(last - path - 1));
+        dir[last - path - 1] = 0;
+    }
+    p.name = last + 1;
+    p.fd = openat(root_fd, dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+    return p;
+}
+
+#define AUTO_PARENT __attribute__((cleanup(close_parent))) Parent
+
+static int hidden_name(const char *name) {
+    return !strcmp(name, ".") || !strcmp(name, "..") ||
+           !strncasecmp(name, TEMP_PREFIX, sizeof TEMP_PREFIX - 1);
+}
+
+static void temp_name(char *out, size_t cap) {
+    uint64_t token;
+    arc4random_buf(&token, sizeof token);
+    snprintf(out, cap, TEMP_PREFIX "%016llx", (unsigned long long)token);
 }
 
 /* ---- the folder ---- */
@@ -332,7 +359,7 @@ static void add_entry(Text *t, const char *url_path, const char *name, const str
             "<D:lockdiscovery/>");
     if (is_root) {
         struct statfs fs;
-        if (statfs(root, &fs) == 0) {
+        if (fstatfs(root_fd, &fs) == 0) {
             addf(t, "<D:quota-available-bytes>%llu</D:quota-available-bytes><D:quota-used-bytes>%llu</D:quota-used-bytes>",
                  (unsigned long long)fs.f_bavail * fs.f_bsize, (unsigned long long)(fs.f_blocks - fs.f_bfree) * fs.f_bsize);
         }
@@ -342,30 +369,32 @@ static void add_entry(Text *t, const char *url_path, const char *name, const str
 
 static int do_propfind(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
-    char local[PATH_MAX];
     struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0 || stat(local, &st) != 0) return respond_empty(c, r, 404, "Not Found");
+    int fd = open_shared(r->path, &st);
+    if (fd < 0) return respond_empty(c, r, 404, "Not Found");
     Text t = {0};
     adds(&t, "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">");
     const char *slash = strrchr(r->path, '/');
     int is_root = strcmp(r->path, "/") == 0;
     add_entry(&t, r->path, is_root ? "Henge" : (slash && slash[1] ? slash + 1 : r->path), &st, is_root);
     if (S_ISDIR(st.st_mode) && r->depth != 0) {
-        DIR *d = opendir(local);
+        DIR *d = fdopendir(fd);
+        if (d) fd = -1;
         struct dirent *e;
-        while (d && (e = readdir(d))) {
-            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !strncmp(e->d_name, TEMP_PREFIX, strlen(TEMP_PREFIX))) continue;
-            char child[PATH_MAX], url[PATH_MAX];
+        while (d && !t.failed && (e = readdir(d))) {
+            if (hidden_name(e->d_name) || (is_root && !strcasecmp(e->d_name, ".henge"))) continue;
+            char url[PATH_MAX];
             struct stat cs;
-            if (snprintf(child, sizeof child, "%s/%s", local, e->d_name) >= (int)sizeof child) continue;
             if (snprintf(url, sizeof url, "%s%s%s", r->path, r->path[strlen(r->path) - 1] == '/' ? "" : "/", e->d_name) >= (int)sizeof url) continue;
-            if (lstat(child, &cs) != 0 || !(S_ISREG(cs.st_mode) || S_ISDIR(cs.st_mode))) continue; /* no links out of the folder */
+            if (fstatat(dirfd(d), e->d_name, &cs, AT_SYMLINK_NOFOLLOW) != 0 || !shared_type(&cs)) continue;
             add_entry(&t, url, e->d_name, &cs, 0);
         }
         if (d) closedir(d);
     }
+    if (fd >= 0) close(fd);
     adds(&t, "</D:multistatus>");
-    int rc = respond(c, r, 207, "Multi-Status", "Content-Type: application/xml; charset=utf-8\r\n", t.s, t.len);
+    int rc = t.failed ? respond_empty(c, r, 507, "Insufficient Storage") :
+        respond(c, r, 207, "Multi-Status", "Content-Type: application/xml; charset=utf-8\r\n", t.s, t.len);
     free(t.s);
     return rc;
 }
@@ -376,21 +405,17 @@ static int do_proppatch(Conn *c, Request *r) {
     adds(&t, "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>");
     add_url(&t, r->path);
     adds(&t, "</D:href><D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>");
-    int rc = respond(c, r, 207, "Multi-Status", "Content-Type: application/xml; charset=utf-8\r\n", t.s, t.len);
+    int rc = t.failed ? respond_empty(c, r, 507, "Insufficient Storage") :
+        respond(c, r, 207, "Multi-Status", "Content-Type: application/xml; charset=utf-8\r\n", t.s, t.len);
     free(t.s);
     return rc;
 }
 
 static int do_get(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
-    char local[PATH_MAX];
     struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 404, "Not Found");
-    int fd = open(local, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        if (fd >= 0) close(fd);
-        return respond_empty(c, r, 404, "Not Found");
-    }
+    int fd = open_shared(r->path, &st);
+    if (fd < 0) return respond_empty(c, r, 404, "Not Found");
     if (S_ISDIR(st.st_mode)) {
         close(fd);
         return respond_empty(c, r, 405, "Method Not Allowed");
@@ -429,6 +454,7 @@ static int do_get(Conn *c, Request *r) {
     if (rc == 0 && strcmp(r->method, "HEAD") != 0) {
         static const size_t piece = 256 * 1024;
         char *buf = malloc(piece);
+        if (!buf) rc = -1;
         long long at = from, left = len;
         while (rc == 0 && left > 0) {
             ssize_t got = pread(fd, buf, (size_t)left < piece ? (size_t)left : piece, at);
@@ -446,39 +472,40 @@ static int do_get(Conn *c, Request *r) {
 
 /* Into a temporary file beside it, then renamed, so a transfer cut short leaves the old file alone. */
 static int do_put(Conn *c, Request *r) {
-    char local[PATH_MAX], temp[PATH_MAX];
-    struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0) {
-        body_discard(c, r);
-        return respond_empty(c, r, 403, "Forbidden");
+    AUTO_PARENT p = open_parent(r->path);
+    if (p.fd < 0) {
+        int gone = errno == ENOENT;
+        if (body_discard(c, r) != 0) return -1;
+        return gone ? respond_empty(c, r, 409, "Conflict") : respond_empty(c, r, 403, "Forbidden");
     }
-    int existed = stat(local, &st) == 0;
-    if (existed && S_ISDIR(st.st_mode)) {
+    struct stat st;
+    int existed = fstatat(p.fd, p.name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+    if (existed && !S_ISREG(st.st_mode)) {
         if (body_discard(c, r) != 0) return -1;
         return respond_empty(c, r, 405, "Method Not Allowed");
     }
-    char *slash = strrchr(local, '/');
-    size_t dir_len = (size_t)(slash - local);
-    if (snprintf(temp, sizeof temp, "%.*s/" TEMP_PREFIX "XXXXXX", (int)dir_len, local) >= (int)sizeof temp) {
-        body_discard(c, r);
-        return respond_empty(c, r, 414, "URI Too Long");
-    }
-    int fd = mkstemp(temp);
+    char temp[64];
+    temp_name(temp, sizeof temp);
+    int fd = openat(p.fd, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) {
-        int gone = errno == ENOENT;
         if (body_discard(c, r) != 0) return -1;
-        return gone ? respond_empty(c, r, 409, "Conflict") : respond_empty(c, r, 507, "Insufficient Storage");
+        return respond_empty(c, r, 507, "Insufficient Storage");
     }
     fchmod(fd, 0644);
     body_ready(c, r);
     static const size_t piece = 256 * 1024;
     char *buf = malloc(piece);
+    if (!buf) {
+        close(fd);
+        unlinkat(p.fd, temp, 0);
+        return -1;
+    }
     int full = 0;
     for (;;) {
         ssize_t got = body_read(c, r, buf, piece);
         if (got < 0) { /* the client went away: no response to give */
             close(fd);
-            unlink(temp);
+            unlinkat(p.fd, temp, 0);
             free(buf);
             return -1;
         }
@@ -496,53 +523,198 @@ static int do_put(Conn *c, Request *r) {
         }
     }
     free(buf);
-    close(fd);
-    if (full || rename(temp, local) != 0) {
-        unlink(temp);
-        return respond_empty(c, r, 507, "Insufficient Storage");
-    }
+    if (close(fd) != 0) full = 1;
+    pthread_mutex_lock(&namespace_lock);
+    int rc = full || !root_is_current() ? -1 : renameat(p.fd, temp, p.fd, p.name);
+    if (rc) unlinkat(p.fd, temp, 0);
+    pthread_mutex_unlock(&namespace_lock);
+    if (rc) return respond_empty(c, r, 507, "Insufficient Storage");
     return existed ? respond_empty(c, r, 204, "No Content") : respond_empty(c, r, 201, "Created");
 }
 
-static int remove_path(const char *local) {
-    struct stat st;
-    if (lstat(local, &st) != 0) return -1;
-    if (S_ISDIR(st.st_mode)) return removefile(local, NULL, REMOVEFILE_RECURSIVE);
-    return unlink(local);
+/* Never traverse a link in a tree. Bound recursion and use the pinned parent for every operation. */
+#define TREE_DEPTH 128
+
+static int remove_at(int parent, const char *name, unsigned depth) {
+    if (unlinkat(parent, name, 0) == 0) return 0;
+    if (depth == TREE_DEPTH) { errno = ELOOP; return -1; }
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return -1; }
+    int rc = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *e = readdir(dir);
+        if (!e) { rc = errno ? -1 : 0; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (remove_at(fd, e->d_name, depth + 1) != 0) { rc = -1; break; }
+    }
+    int error = errno;
+    closedir(dir);
+    if (rc) { errno = error; return -1; }
+    return unlinkat(parent, name, AT_REMOVEDIR);
 }
 
 static int do_delete(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
-    char local[PATH_MAX];
-    if (strcmp(r->path, "/") == 0 || local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
-    if (remove_path(local) != 0) return errno == ENOENT ? respond_empty(c, r, 404, "Not Found") : respond_empty(c, r, 403, "Forbidden");
+    AUTO_PARENT p = open_parent(r->path);
+    if (p.fd < 0) return errno == ENOENT ? respond_empty(c, r, 404, "Not Found") : respond_empty(c, r, 403, "Forbidden");
+    pthread_mutex_lock(&namespace_lock);
+    int rc = remove_at(p.fd, p.name, 0), error = errno;
+    pthread_mutex_unlock(&namespace_lock);
+    if (rc) return error == ENOENT ? respond_empty(c, r, 404, "Not Found") : respond_empty(c, r, 403, "Forbidden");
     return respond_empty(c, r, 204, "No Content");
 }
 
 static int do_mkcol(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
-    char local[PATH_MAX];
-    if (local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
-    if (mkdir(local, 0755) == 0) return respond_empty(c, r, 201, "Created");
-    if (errno == EEXIST) return respond_empty(c, r, 405, "Method Not Allowed");
-    if (errno == ENOENT) return respond_empty(c, r, 409, "Conflict");
+    AUTO_PARENT p = open_parent(r->path);
+    int error = errno;
+    if (p.fd >= 0) {
+        pthread_mutex_lock(&namespace_lock);
+        int rc = mkdirat(p.fd, p.name, 0755);
+        error = errno;
+        pthread_mutex_unlock(&namespace_lock);
+        if (!rc) return respond_empty(c, r, 201, "Created");
+    }
+    if (error == EEXIST) return respond_empty(c, r, 405, "Method Not Allowed");
+    if (error == ENOENT) return respond_empty(c, r, 409, "Conflict");
     return respond_empty(c, r, 403, "Forbidden");
+}
+
+static int same_file(const struct stat *a, const struct stat *b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* Moving Shared in Files revokes the guest's access to that directory. */
+static int root_is_current(void) {
+    int fd = open(root_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat pinned, named;
+    int current = fstat(root_fd, &pinned) == 0 && fstat(fd, &named) == 0 && same_file(&pinned, &named);
+    close(fd);
+    return current;
+}
+
+/* Compare directory identities so APFS case and normalization aliases are covered. */
+static int contains(int parent, const struct stat *target) {
+    struct stat root, st;
+    if (fstat(root_fd, &root) != 0) return 1;
+    int fd = openat(parent, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (unsigned i = 0; fd >= 0 && i <= TREE_DEPTH; i++) {
+        if (fstat(fd, &st) != 0) break;
+        if (same_file(&st, target)) { close(fd); return 1; }
+        if (same_file(&st, &root)) { close(fd); return 0; }
+        int next = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+        close(fd);
+        fd = next;
+    }
+    if (fd >= 0) close(fd);
+    return 1;
+}
+
+/* A failed copy leaves the destination in place. The caller removes the staged tree if needed. */
+static int copy_at(int from, const char *src, int to, const char *dst, unsigned depth, int *created) {
+    int fd = openat(from, src, O_RDONLY | O_NONBLOCK | O_NOFOLLOW_ANY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !shared_type(&st) || depth > TREE_DEPTH) { close(fd); return -1; }
+    if (S_ISREG(st.st_mode)) {
+        int out = openat(to, dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (out >= 0) *created = 1;
+        int rc = out < 0 ? -1 : fcopyfile(fd, out, NULL, COPYFILE_DATA | COPYFILE_XATTR);
+        if (out >= 0 && close(out) != 0) rc = -1;
+        close(fd);
+        return rc;
+    }
+    if (mkdirat(to, dst, 0755) != 0) { close(fd); return -1; }
+    *created = 1;
+    int out = openat(to, dst, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+    DIR *dir = out >= 0 ? fdopendir(fd) : NULL;
+    int rc = dir ? 0 : -1;
+    while (!rc) {
+        errno = 0;
+        struct dirent *e = readdir(dir);
+        if (!e) { rc = errno ? -1 : 0; break; }
+        if (hidden_name(e->d_name)) continue;
+        int child_created = 0;
+        rc = copy_at(fd, e->d_name, out, e->d_name, depth + 1, &child_created);
+    }
+    if (dir) closedir(dir);
+    else close(fd);
+    if (out >= 0) close(out);
+    return rc;
+}
+
+/* Existing collections cannot be overwritten with an ordinary rename. Swap
+   them first, then hide the old destination under a private name for cleanup. */
+static int move_at(Parent from, Parent to, int overwrite, int existed, int same) {
+    if (!overwrite) return renameatx_np(from.fd, from.name, to.fd, to.name, RENAME_EXCL);
+    if (!existed || same) return renameat(from.fd, from.name, to.fd, to.name);
+    char temp[64];
+    temp_name(temp, sizeof temp);
+    if (renameatx_np(from.fd, from.name, to.fd, to.name, RENAME_SWAP) != 0) return -1;
+    if (renameatx_np(from.fd, from.name, from.fd, temp, RENAME_EXCL) != 0) {
+        int error = errno;
+        renameatx_np(from.fd, from.name, to.fd, to.name, RENAME_SWAP);
+        errno = error;
+        return -1;
+    }
+    remove_at(from.fd, temp, 0);
+    return 0;
+}
+
+/* Return an HTTP status without writing to the socket under the namespace lock. */
+static int move_copy_status(Request *r, int move) {
+    AUTO_PARENT from = open_parent(r->path), to = open_parent(r->destination);
+    struct stat src, dst;
+    if (from.fd < 0 || fstatat(from.fd, from.name, &src, AT_SYMLINK_NOFOLLOW) != 0 || !shared_type(&src))
+        return 404;
+    if (to.fd < 0) return 409;
+    int existed = fstatat(to.fd, to.name, &dst, AT_SYMLINK_NOFOLLOW) == 0;
+    if (existed && !r->overwrite) return 412;
+    int same = existed && same_file(&src, &dst);
+    if (same && !move) return 403;
+    if ((S_ISDIR(src.st_mode) && contains(to.fd, &src)) ||
+        (existed && S_ISDIR(dst.st_mode) && contains(from.fd, &dst))) return 409;
+
+    int rc;
+    if (move) {
+        rc = move_at(from, to, r->overwrite, existed, same);
+    } else {
+        char temp[64];
+        int created = 0;
+        temp_name(temp, sizeof temp);
+        rc = copy_at(from.fd, from.name, to.fd, temp, 0, &created);
+        if (!rc) rc = renameatx_np(to.fd, temp, to.fd, to.name, existed ? RENAME_SWAP : RENAME_EXCL);
+        int error = errno;
+        if (created && (rc || existed)) remove_at(to.fd, temp, 0);
+        errno = error;
+    }
+    if (rc) {
+        if (errno == EEXIST && !r->overwrite) return 412;
+        if (errno == ENOENT || errno == ENOTEMPTY || errno == EISDIR || errno == ENOTDIR) return 409;
+        return 403;
+    }
+    return existed ? 204 : 201;
 }
 
 static int do_move_copy(Conn *c, Request *r, int move) {
     if (body_discard(c, r) != 0) return -1;
-    char from[PATH_MAX], to[PATH_MAX];
-    struct stat st;
-    if (!r->destination[0] || strcmp(r->path, "/") == 0 || local_path(r->path, from, sizeof from) != 0 ||
-        local_path(r->destination, to, sizeof to) != 0)
+    if (!r->destination[0] || !r->path[1] || !r->destination[1] || internal_path(r->destination))
         return respond_empty(c, r, 400, "Bad Request");
-    if (stat(from, &st) != 0) return respond_empty(c, r, 404, "Not Found");
-    int existed = stat(to, &st) == 0;
-    if (existed && !r->overwrite) return respond_empty(c, r, 412, "Precondition Failed");
-    if (existed && strcmp(from, to) != 0 && remove_path(to) != 0) return respond_empty(c, r, 403, "Forbidden");
-    int rc = move ? rename(from, to) : copyfile(from, to, NULL, COPYFILE_ALL | COPYFILE_RECURSIVE);
-    if (rc != 0) return errno == ENOENT ? respond_empty(c, r, 409, "Conflict") : respond_empty(c, r, 403, "Forbidden");
-    return existed ? respond_empty(c, r, 204, "No Content") : respond_empty(c, r, 201, "Created");
+    pthread_mutex_lock(&namespace_lock);
+    int status = move_copy_status(r, move);
+    pthread_mutex_unlock(&namespace_lock);
+    switch (status) {
+        case 201: return respond_empty(c, r, 201, "Created");
+        case 204: return respond_empty(c, r, 204, "No Content");
+        case 404: return respond_empty(c, r, 404, "Not Found");
+        case 409: return respond_empty(c, r, 409, "Conflict");
+        case 412: return respond_empty(c, r, 412, "Precondition Failed");
+        default: return respond_empty(c, r, 403, "Forbidden");
+    }
 }
 
 static int do_lock(Conn *c, Request *r) {
@@ -556,14 +728,19 @@ static int do_lock(Conn *c, Request *r) {
         snprintf(token, sizeof token, "opaquelocktoken:henge-%lx-%lx", (unsigned long)time(NULL), __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED));
     }
     int status = 200;
-    char local[PATH_MAX];
-    struct stat st;
-    if (local_path(r->path, local, sizeof local) != 0) return respond_empty(c, r, 403, "Forbidden");
-    if (stat(local, &st) != 0) { /* locking a name that isn't there makes an empty file */
-        int fd = open(local, O_CREAT | O_WRONLY, 0644);
-        if (fd < 0) return respond_empty(c, r, 409, "Conflict");
-        close(fd);
-        status = 201;
+    if (r->path[1]) {
+        AUTO_PARENT p = open_parent(r->path);
+        struct stat st;
+        if (p.fd < 0) return respond_empty(c, r, 409, "Conflict");
+        if (fstatat(p.fd, p.name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) return respond_empty(c, r, 409, "Conflict");
+            pthread_mutex_lock(&namespace_lock);
+            int fd = openat(p.fd, p.name, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0644);
+            pthread_mutex_unlock(&namespace_lock);
+            if (fd < 0) return respond_empty(c, r, 409, "Conflict");
+            close(fd);
+            status = 201;
+        } else if (!shared_type(&st)) return respond_empty(c, r, 403, "Forbidden");
     }
     Text t = {0};
     addf(&t, "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>"
@@ -572,7 +749,8 @@ static int do_lock(Conn *c, Request *r) {
          token);
     char headers[256];
     snprintf(headers, sizeof headers, "Content-Type: application/xml; charset=utf-8\r\nLock-Token: <%s>\r\n", token);
-    int rc = respond(c, r, status, status == 201 ? "Created" : "OK", headers, t.s, t.len);
+    int rc = t.failed ? respond_empty(c, r, 507, "Insufficient Storage") :
+        respond(c, r, status, status == 201 ? "Created" : "OK", headers, t.s, t.len);
     free(t.s);
     return rc;
 }
@@ -619,52 +797,16 @@ static int serve_agent(Conn *c, Request *r) {
     return rc;
 }
 
-/* GET ?since=N waits up to 25 s for a newer clipboard than N. */
-static int clipboard_get(Conn *c, Request *r) {
-    if (body_discard(c, r) != 0) return -1;
-    unsigned long since = 0;
-    const char *q = strstr(r->query, "since=");
-    if (q) since = strtoul(q + 6, NULL, 10);
-    struct timespec until;
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    until.tv_sec = now.tv_sec + 25;
-    until.tv_nsec = now.tv_usec * 1000;
-    pthread_mutex_lock(&clip_mu);
-    agent_seen = time(NULL);
-    while (device_seq <= since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
-    agent_seen = time(NULL);
-    unsigned long seq = device_seq;
-    char *text = seq > since && device_clip ? strdup(device_clip) : NULL;
-    pthread_mutex_unlock(&clip_mu);
-    char headers[64];
-    snprintf(headers, sizeof headers, "X-Henge-Seq: %lu\r\n", seq);
-    int rc = text ? respond(c, r, 200, "OK", headers, text, strlen(text)) : respond(c, r, 204, "No Content", headers, NULL, 0);
-    free(text);
-    return rc;
-}
-
-static int clipboard_put(Conn *c, Request *r) {
-    size_t len = 0;
-    char *text = body_small(c, r, &len);
-    if (!text) return -1;
-    pthread_mutex_lock(&clip_mu);
-    free(guest_clip);
-    guest_clip = text;
-    agent_seen = time(NULL);
-    pthread_mutex_unlock(&clip_mu);
-    return respond_empty(c, r, 204, "No Content");
-}
-
 static int serve_henge(Conn *c, Request *r) {
-    const char *what = r->path + strlen("/.henge/");
+    const char *what = r->path[7] == '/' ? r->path + 8 : "";
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
     }
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
-    if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
-    if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
+    /* An installed older helper backs off on a closed connection, but retries
+       immediately after an HTTP response. */
+    if (!strcmp(what, "clipboard")) return -1;
     if (body_discard(c, r) != 0) return -1;
     return respond_empty(c, r, 404, "Not Found");
 }
@@ -688,7 +830,7 @@ static int read_request(Conn *c, Request *r) {
         char ch;
         ssize_t got = conn_read(c, &ch, 1);
         if (got <= 0) return n ? -1 : 0;
-        if (n + 1 >= sizeof head) return -1;
+        if (!ch || n + 1 >= sizeof head) return -1;
         head[n++] = ch;
         if (n >= 4 && !memcmp(head + n - 4, "\r\n\r\n", 4)) break;
         if (n == 2 && !memcmp(head, "\r\n", 2)) n = 0; /* blank lines between requests */
@@ -699,14 +841,12 @@ static int read_request(Conn *c, Request *r) {
     r->overwrite = 1;
     r->depth = 1;
     char *line = head, *eol = strstr(line, "\r\n");
+    if (!eol) return -1;
     *eol = 0;
     char version[16];
     if (sscanf(line, "%15s %32767s %15s", r->method, r->target, version) != 3) return -1;
     char *query = strchr(r->target, '?');
-    if (query) {
-        *query++ = 0;
-        snprintf(r->query, sizeof r->query, "%s", query);
-    }
+    if (query) *query = 0;
     /* A client may send the whole URL. */
     if (!strncasecmp(r->target, "http://", 7)) {
         char *p = strchr(r->target + 7, '/');
@@ -749,7 +889,7 @@ static int read_request(Conn *c, Request *r) {
 }
 
 static int handle(Conn *c, Request *r) {
-    if (!strncmp(r->path, "/.henge/", 8)) return serve_henge(c, r);
+    if (internal_path(r->path)) return serve_henge(c, r);
     const char *m = r->method;
     if (!strcmp(m, "OPTIONS")) {
         if (body_discard(c, r) != 0) return -1;
@@ -773,10 +913,12 @@ static int handle(Conn *c, Request *r) {
     return respond_empty(c, r, 405, "Method Not Allowed");
 }
 
+static unsigned active_connections;
+
 static void *connection(void *arg) {
     Conn *c = arg;
     Request *r = malloc(sizeof *r);
-    for (;;) {
+    while (r) {
         int got = read_request(c, r);
         if (got <= 0) {
             if (got < 0) {
@@ -787,12 +929,18 @@ static void *connection(void *arg) {
             }
             break;
         }
+        if (!root_is_current()) {
+            r->close = 1;
+            respond_empty(c, r, 403, "Forbidden");
+            break;
+        }
         if (getenv("HV_SHARE_LOG")) fprintf(stderr, "share: %s %s\n", r->method, r->path);
         if (handle(c, r) != 0 || r->close) break;
     }
     close(c->fd);
     free(r);
     free(c);
+    __atomic_sub_fetch(&active_connections, 1, __ATOMIC_RELAXED);
     return NULL;
 }
 
@@ -807,8 +955,14 @@ static void *listener(void *arg) {
         }
         int on = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+        struct timeval idle = {.tv_sec = 30};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof idle);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof idle);
+        if (__atomic_load_n(&active_connections, __ATOMIC_RELAXED) >= 32) { close(fd); continue; }
         Conn *c = calloc(1, sizeof *c);
+        if (!c) { close(fd); continue; }
         c->fd = fd;
+        __atomic_add_fetch(&active_connections, 1, __ATOMIC_RELAXED);
         pthread_t t;
         pthread_attr_t a;
         pthread_attr_init(&a);
@@ -816,6 +970,7 @@ static void *listener(void *arg) {
         if (pthread_create(&t, &a, connection, c) != 0) {
             close(fd);
             free(c);
+            __atomic_sub_fetch(&active_connections, 1, __ATOMIC_RELAXED);
         }
         pthread_attr_destroy(&a);
     }
@@ -824,25 +979,35 @@ static void *listener(void *arg) {
 
 int hv_share_start(const char *folder, const char *socket_path, const char *agent) {
     static int started;
-    if (started) return 0;
-    if (!realpath(folder, root)) return -1;
+    if (started) return root_is_current() ? 0 : -1;
+    if (!realpath(folder, root_path)) return -1;
     if (agent) snprintf(agent_path, sizeof agent_path, "%s", agent);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
     if (strlen(socket_path) >= sizeof addr.sun_path) {
         fprintf(stderr, "hengevm: share: socket path too long: %s\n", socket_path);
         return -1;
     }
+    root_fd = open(root_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC);
+    if (root_fd < 0) return -1;
     strcpy(addr.sun_path, socket_path);
     unlink(socket_path);
     int server = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server < 0 || bind(server, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(server, 16) != 0) {
         fprintf(stderr, "hengevm: share: %s: %s\n", socket_path, strerror(errno));
         if (server >= 0) close(server);
+        close(root_fd);
+        root_fd = -1;
         return -1;
     }
     chmod(socket_path, 0600);
     pthread_t t;
-    pthread_create(&t, NULL, listener, (void *)(intptr_t)server);
+    if (pthread_create(&t, NULL, listener, (void *)(intptr_t)server) != 0) {
+        close(server);
+        close(root_fd);
+        root_fd = -1;
+        unlink(socket_path);
+        return -1;
+    }
     pthread_detach(t);
     started = 1;
     return 0;

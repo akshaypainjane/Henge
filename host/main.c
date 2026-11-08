@@ -552,12 +552,6 @@ static void *input_thread(void *unused) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
             hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
         }
-        else if (!strncmp(line, "clip ", 5)) hv_share_set_clipboard(line + 5);
-        else if (!strncmp(line, "getclip", 7)) {
-            char *text = hv_share_take_clipboard();
-            fprintf(stderr, "hengevm: guest clipboard: %s (agent seen %ld s ago)\n", text ? text : "(nothing new)", hv_share_agent_seen());
-            free(text);
-        }
         else if (sscanf(line, "hiddown %i", &x) == 1) hv_vm_key_hid((uint8_t)x, 1);
         else if (sscanf(line, "hidup %i", &x) == 1) hv_vm_key_hid((uint8_t)x, 0);
         else if (sscanf(line, "hidkey %i", &x) == 1) {

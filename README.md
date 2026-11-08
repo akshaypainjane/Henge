@@ -29,7 +29,7 @@ Download macOS, install it on the device, and use it.
 - **Touch** — The screen is a trackpad: hold to drag, two fingers to scroll. Esc, Tab, Control, Option and Command sit above the keyboard.
 - **Keyboard and mouse** — On iPad, a Magic Keyboard or a Bluetooth keyboard and mouse drive the Mac directly.
 - **External display (iOS 27+)** — During a Mac session, connect a display with a video-capable USB-C cable or a USB-C/HDMI dock. The mode activates automatically: the monitor shows the Mac, while the iPhone or iPad keeps its trackpad and keyboard controls. Disconnect to return the image to the device. The existing guest resolution is preserved; older iOS versions keep system mirroring. USB-C video is user-confirmed on an iPhone 17 Pro running iOS 27 (development build 0.1/2).
-- **Sharing** — Copy and paste between macOS and the device, and a shared folder that shows up in Files and on the Mac.
+- **Sharing** — A shared folder in Files and on the Mac. The paste button types supported characters as a single line.
 - **Fits the screen** — On iPad, a new Mac gets a screen the shape of the iPad's, so there are no black bars.
 
 On an iPhone 17 Pro, macOS reaches the lock screen in about 15 seconds. Discord installs, opens in about 15 seconds, logs in and sends messages.
@@ -46,9 +46,11 @@ Then open the Install tab, pick macOS Sequoia 15.6.1, and keep Henge open with t
 
 ## Sharing with the Mac
 
+On iPhone and iPad, enable **Settings › Sharing › Share files with macOS** before starting the virtual Mac.
+
 Do this once for each Mac: open Terminal on the Mac, then in Henge open Details and tap **Type the Set Up Command**. Press Return on the Mac, and choose Allow when macOS asks about `henge-agent` and local networks. It needs the Mac's keyboard layout to be U.S.
 
-Then a Henge folder in the Mac's home folder is the same folder as Files › Henge › Shared. What you copy on the Mac is copied on the device too, and the paste button pastes from the device into the Mac.
+Then a Henge folder in the Mac's home folder is the same folder as Files › Henge › Shared. Use the paste button to type supported characters from the device into the Mac. If you previously installed the clipboard helper, run the setup command again to update it to the folder-only helper.
 
 ## Known limits
 

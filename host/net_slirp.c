@@ -291,7 +291,7 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
             if (slirp_add_hostfwd(slirp, 0, h, hp, g, gp) != 0) fprintf(stderr, "hengevm: no forward for port %d\n", hp);
         }
     }
-    if (share_socket[0]) { /* 10.0.2.4:80 is the shared folder and clipboard: see share.c */
+    if (share_socket[0]) { /* 10.0.2.4:80 is the shared folder: see share.c */
         struct in_addr addr;
         inet_pton(AF_INET, HV_SHARE_ADDR, &addr);
         if (slirp_add_unix(slirp, share_socket, &addr, 80) != 0) fprintf(stderr, "hengevm: net: no route to the shared folder\n");
