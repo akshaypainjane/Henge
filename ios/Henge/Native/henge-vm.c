@@ -26,6 +26,7 @@ static pthread_mutex_t camera_lock = PTHREAD_MUTEX_INITIALIZER;
 static void on_exit(int reason) {
     exit_reason = reason;
     state = 2;
+    hv_net_set_local_ssh(0);
     henge_vm_camera_share(0);
     fprintf(stderr, "henge: the machine stopped (%s)\n", hv_vm_reason_name(reason));
 }
@@ -138,6 +139,9 @@ uint32_t henge_vm_jit_generation(void) {
     return state ? __atomic_load_n(&hv_vm_machine()->jit_gen, __ATOMIC_RELAXED) : 0;
 }
 uint64_t henge_vm_net_frames(int sent) { return sent ? hv_net_tx_frames : hv_net_rx_frames; }
+int henge_vm_local_ssh(int enabled) { return state == 1 || !enabled ? hv_net_set_local_ssh(enabled) : -1; }
+int henge_vm_local_ssh_status(void) { return hv_net_local_ssh_status(); }
+int henge_vm_local_ssh_port(void) { return HV_LOCAL_SSH_PORT; }
 
 int henge_vm_cpus_on(void) {
     int n = 0;

@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <libslirp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,7 @@ static int npfd;
 uint64_t hv_net_tx_frames, hv_net_rx_frames;
 
 static char share_socket[256];
+static atomic_int network_ready, ssh_requested, ssh_status;
 
 void hv_net_set_share_socket(const char *path) {
     snprintf(share_socket, sizeof share_socket, "%s", path ? path : "");
@@ -156,6 +158,15 @@ static void notify(void *opaque) {
     (void)!write(wake_pipe[1], &c, 1);
 }
 
+int hv_net_set_local_ssh(int enabled) {
+    if (!atomic_load(&network_ready)) return -1;
+    atomic_store(&ssh_requested, enabled != 0);
+    notify(NULL);
+    return 0;
+}
+
+int hv_net_local_ssh_status(void) { return atomic_load(&ssh_status); }
+
 static int add_poll(slirp_os_socket fd, int events, void *opaque) {
     (void)opaque;
     if (npfd == MAX_POLL) return -1;
@@ -195,7 +206,26 @@ static const SlirpCb callbacks = {
 
 static void *net_thread(void *unused) {
     (void)unused;
+    const struct in_addr loopback = { .s_addr = htonl(INADDR_LOOPBACK) };
+    struct in_addr guest;
+    inet_pton(AF_INET, "10.0.2.15", &guest);
+    int applied_ssh = 0;
     for (;;) {
+        int requested = atomic_load(&ssh_requested);
+        if (requested != applied_ssh) {
+            if (requested) {
+                int rc = slirp_add_hostfwd(slirp, 0, loopback, HV_LOCAL_SSH_PORT, guest, 22);
+                atomic_store(&ssh_status, rc == 0 ? 1 : -1);
+                fprintf(stderr, "hengevm: local SSH forward %s on 127.0.0.1:%d\n",
+                        rc == 0 ? "listening" : "could not listen", HV_LOCAL_SSH_PORT);
+            } else {
+                if (atomic_load(&ssh_status) == 1)
+                    slirp_remove_hostfwd(slirp, 0, loopback, HV_LOCAL_SSH_PORT);
+                atomic_store(&ssh_status, 0);
+                fprintf(stderr, "hengevm: local SSH listener closed\n");
+            }
+            applied_ssh = requested;
+        }
         uint32_t timeout = 1000;
         int64_t now = now_ms();
         for (int i = 0; i < MAX_TIMERS; i++)
@@ -299,6 +329,15 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     net = n;
     n->transmit = transmit;
     pthread_t t;
-    pthread_create(&t, NULL, net_thread, NULL);
+    if (pthread_create(&t, NULL, net_thread, NULL) != 0) {
+        n->transmit = NULL;
+        net = NULL;
+        slirp_cleanup(slirp);
+        close(wake_pipe[0]);
+        close(wake_pipe[1]);
+        return -1;
+    }
+    pthread_detach(t);
+    atomic_store(&network_ready, 1);
     return 0;
 }

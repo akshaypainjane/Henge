@@ -58,6 +58,15 @@ With the Mac running, open Henge’s **Details → iPad Camera → Share Front C
 
 Henge passes live video in memory to a virtual USB camera. Henge skips saving desktop previews for the rest of a session once camera sharing starts. Guest apps can still take pictures or record video when given access in macOS.
 
+## Local SSH
+
+In the virtual Mac, enable **System Settings → General → Sharing → Remote Login** for your account. In Henge, turn on **Details → Local SSH → Allow Local SSH Connections**. Henge forwards the iPad’s loopback port `127.0.0.1:40222` to the guest’s SSH server for this session.
+
+- From the iPad, use an SSH client with `127.0.0.1`, port `40222`, and the guest’s short username. Keep Henge running alongside the client.
+- From a Mac connected by USB, run `python3 tools/ipad-ssh.py GUEST_USER` from the repository. Add `-- 'your command'` after the username to run a single command. OpenSSH handles host key verification and login.
+
+Turning off Henge’s switch closes the listener for new connections. Turn off Remote Login in the guest to end existing sessions as well.
+
 ## Known limits
 
 - Signing in to an Apple Account inside macOS fails with a verification error.

@@ -21,6 +21,8 @@ struct SessionView: View {
     @AppStorage("henge.cpus") private var cpus = 4
     @AppStorage(Sharing.enabledKey) private var shareFiles = false
     @State private var sharingActive = false
+    @State private var localSSH = false
+    @State private var localSSHStatus: Int32 = 0
 
     @State private var typing = false
     @State private var zoomed = false
@@ -116,6 +118,7 @@ struct SessionView: View {
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             camera.stop()
+            henge_vm_local_ssh(0)
             zoomFollowing?.cancel()
             StickyKeys.shared.releaseAll()
             HardwareKeys.releaseAll()
@@ -408,6 +411,19 @@ struct SessionView: View {
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
+                Section("Local SSH") {
+                    Toggle("Allow Local SSH Connections", isOn: $localSSH)
+                        .disabled(state != 1)
+                        .onChange(of: localSSH) { enabled in
+                            localSSHStatus = henge_vm_local_ssh(enabled ? 1 : 0) == 0 ? 0 : -1
+                        }
+                    if localSSH {
+                        Text(localSSHStatus > 0 ? "Listening on 127.0.0.1:\(henge_vm_local_ssh_port())" :
+                                localSSHStatus < 0 ? "Could not open the local port." : "Opening local port…")
+                    }
+                    Text("Turn on Remote Login in macOS. Connect from an SSH client on this device or a paired Mac over USB. To end active sessions, turn off Remote Login in macOS.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Sharing") {
                     if sharingActive {
                         Button("Type the Set Up Command") {
@@ -495,9 +511,11 @@ struct SessionView: View {
             lastTime = now
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
+            if localSSHStatus >= 0 { localSSHStatus = henge_vm_local_ssh_status() }
             if showDetails { log = Array(HengeLog.recentLines(200)) }
             if state == 2 {
                 camera.stop()
+                localSSH = false
                 break
             }
             tick += 1

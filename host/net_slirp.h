@@ -8,6 +8,11 @@
 void hv_net_set_share_socket(const char *path);
 /* User-mode NAT for the guest's virtio-net (see net_slirp.c). Returns 0 on success. */
 int hv_net_attach(HvMachine *m, HvVirtioNet *n);
+enum { HV_LOCAL_SSH_PORT = 40222 };
+/* Request a loopback-only forward to the guest's SSH port. Network thread applies it. */
+int hv_net_set_local_ssh(int enabled);
+/* 0 closed, 1 listening, -1 bind failed. */
+int hv_net_local_ssh_status(void);
 /* CPU thread, from the board's tick: hand frames for the guest to the device. */
 void hv_net_poll(void);
 
