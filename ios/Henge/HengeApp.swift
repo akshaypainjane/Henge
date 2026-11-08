@@ -12,7 +12,6 @@ struct HengeApp: App {
         // allocator's first lines land in Documents/henge.log too.
         HengeLog.start()
         HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")
-        EngineTuning.apply()
         HengeLog.logFootprint("app-launch")
         JITBootstrap.noteLaunchState()
         HengeLog.log("app", "increased memory limit: \(Entitlements.increasedMemory ? "yes" : "no"); extended addressing: \(Entitlements.extendedAddressing ? "yes" : "no"); limit \(Entitlements.memoryLimitAtLaunch >> 20) MB")

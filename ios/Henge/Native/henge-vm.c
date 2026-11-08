@@ -33,7 +33,7 @@ static void on_exit(int reason) {
 }
 
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
-                  int cpus, int camera, char *err, size_t errlen) {
+                  int cpus, int camera, const HvVmTuning *tuning, char *err, size_t errlen) {
     { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
     if (state) {
         snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
@@ -45,11 +45,10 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
         return -1;
     }
     HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .seed = seed, .ram_mb = ram_mb, .ncpus = cpus, .log = 1, .camera = camera,
-                    .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+                    .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size, .tuning = tuning};
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
     if (hv_vm_create(&c, err, errlen) != 0) return -1;
-    if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
     state = 1;
     hv_vm_start(1, on_exit);
     return 0;
@@ -94,7 +93,8 @@ static void on_install_progress(int step, double p, void *user) {
 }
 
 int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_t ecid, const char *ipsw,
-                     const char *workdir, const char *tempdir, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
+                     const char *workdir, const char *tempdir, uint64_t ram_mb, int cpus,
+                     const HvVmTuning *tuning, char *err, size_t errlen) {
     if (state) {
         snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
         return -1;
@@ -105,7 +105,8 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
         return -1;
     }
     HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .ram_mb = ram_mb, .ncpus = cpus, .log = 1,
-                    .installer = 1, .no_sound = 1, .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+                    .installer = 1, .no_sound = 1, .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr,
+                    .jit_bytes = jit->size, .tuning = tuning};
     fprintf(stderr, "henge: installing %s with %d CPUs, %llu MB RAM\n", ipsw, cpus, (unsigned long long)ram_mb);
     if (hv_vm_create(&c, err, errlen) != 0) return -1;
     install_step = 0;

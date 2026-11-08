@@ -45,6 +45,7 @@
 #define MAX_CHANNELS 16
 
 struct HvPvgLite {
+    uint32_t refresh_hz;
     HvMachine *m;
     HvGic *gic;
     int gfx_irq, iosfc_irq;
@@ -158,6 +159,10 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
     display_h = height;
 }
 
+void hv_pvg_lite_set_refresh_rate(HvPvgLite *p, uint32_t hz) {
+    if (p) p->refresh_hz = hz > 0 && hz <= UINT16_MAX ? hz : 60;
+}
+
 static void display_set_page(HvPvgLite *p, uint64_t pa) {
     uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
     if (!d) return;
@@ -175,11 +180,7 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
     PUTF(0x28, (float)height_mm);
     PUT32(0x208, 1); /* one mode: */
     PUT32(0x210, display_h << 16 | display_w);
-    {   /* m4 fork: 120 Hz on ProMotion (HV_HZ), so WindowServer animates at the panel's rate */
-        const char *hz = getenv("HV_HZ");
-        uint32_t r = hz && atoi(hz) > 0 ? (uint32_t)atoi(hz) : 60;
-        PUT32(0x214, r << 16);
-    }
+    PUT32(0x214, p->refresh_hz << 16);
     PUTF(0xa10, 1.0f); /* identity colour matrix */
     PUTF(0xa24, 1.0f);
     PUTF(0xa38, 1.0f);
@@ -755,6 +756,8 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
     p->gic = gic;
     p->gfx_irq = gfx_irq;
     p->iosfc_irq = iosfc_irq;
+    const char *hz = getenv("HV_HZ");
+    hv_pvg_lite_set_refresh_rate(p, hz ? (uint32_t)atoi(hz) : 60);
     p->log = getenv("HV_PVG_LITE_LOG") != NULL;
     p->tally = getenv("HV_PVG_TALLY") != NULL;
     hv_machine_add_mmio(m, gfx_pa, 0x10000, p, gfx_read, gfx_write, "gfx");

@@ -499,11 +499,24 @@ static void test_virtio_blk(HvDisk *aux) {
     check("blk write status", ram(status)[0], 0);
     check("blk write reached the file", memcmp(back, ram(data), 512), 0);
 
-    /* Apple barrier, then an unknown type */
-    h[0] = 0x10000;
+    h[0] = 4; /* VIRTIO_BLK_T_FLUSH */
     memcpy(ram(hdr), h, 16);
     put_desc(ring, 6, hdr, 16, 1, 7);
     put_desc(ring, 7, status, 1, 2, 0);
+    const HvDiskFlushMode modes[] = {HV_DISK_FLUSH_SYNC, HV_DISK_FLUSH_BARRIER};
+    for (size_t i = 0; i < sizeof modes / sizeof modes[0]; i++) {
+        aux->flush_mode = modes[i];
+        ram(status)[0] = 0xff;
+        offer(ring, 6);
+        wr16(bar + 0x3000, 0);
+        hv_virtio_blk_drain(board.aux_blk);
+        check("guest flush succeeds on the backing file", ram(status)[0], 0);
+    }
+    aux->flush_mode = HV_DISK_FLUSH_LEGACY;
+
+    /* Apple barrier, then an unknown type */
+    h[0] = 0x10000;
+    memcpy(ram(hdr), h, 16);
     offer(ring, 6);
     wr16(bar + 0x3000, 0);
     hv_virtio_blk_drain(board.aux_blk); /* requests complete on the worker thread */
@@ -514,7 +527,7 @@ static void test_virtio_blk(HvDisk *aux) {
     wr16(bar + 0x3000, 0);
     hv_virtio_blk_drain(board.aux_blk); /* requests complete on the worker thread */
     check("unknown request UNSUPP", ram(status)[0], 2);
-    check("four requests used", used_idx(ring), 4);
+    check("six requests used", used_idx(ring), 6);
     rd8(bar + 0x1000);
 }
 

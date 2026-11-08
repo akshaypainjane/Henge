@@ -26,14 +26,17 @@ struct MacSettingsView: View {
                 DeskHeading("Memory")
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(alignment: .firstTextBaseline) {
-                        Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
+                        Text("\(mac.ramMB / 1024) GB requested").font(.system(size: 26, weight: .bold))
                         Spacer()
                         Text(Entitlements.increasedMemory ? "Outside the app's limit once JIT is on" : "Used from free storage if needed")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                     }
                     Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
                         .font(.system(size: 16))
-                    if let note = Device.memoryNote(mac.ramMB / 1024) {
+                    if !Entitlements.extendedAddressing && mac.ramMB > Int(GuestMemory.standardAddressLimitMiB) {
+                        Text("This installation can allocate up to \(GuestMemory.standardAddressLimitMiB) MiB. See Details after starting for the actual allocation.")
+                            .font(.footnote).foregroundStyle(Desk.dim)
+                    } else if let note = Device.memoryNote(mac.ramMB / 1024) {
                         Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
                     }
                 }

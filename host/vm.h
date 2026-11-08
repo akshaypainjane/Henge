@@ -6,6 +6,7 @@
 
 #include "disk.h"
 #include "vmapple.h"
+#include "vm_tuning.h"
 
 /* The virtual Mac as a host app drives it: build it from files, run it, feed
    it input, stop it. The macOS command-line tool and the iOS app both use this;
@@ -24,6 +25,7 @@ typedef struct HvVmConfig {
     /* JIT memory the host already has (iOS: granted by a debugger), or NULL to map it here. */
     void *jit_rx, *jit_rw;
     size_t jit_bytes;         /* 0: 768 MB */
+    const HvVmTuning *tuning; /* consumed during hv_vm_create */
 } HvVmConfig;
 
 /* Returns 0, or -1 with a reason in err. */

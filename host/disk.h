@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+typedef enum HvDiskFlushMode {
+    HV_DISK_FLUSH_LEGACY,
+    HV_DISK_FLUSH_SYNC,
+    HV_DISK_FLUSH_BARRIER,
+} HvDiskFlushMode;
+
 /* A raw disk image file, optionally starting `offset` bytes in (QEMU's vmapple
    notes say the first 16 KB of auxiliary.bin is metadata the guest never sees). */
 typedef struct HvDisk {
@@ -10,6 +16,7 @@ typedef struct HvDisk {
     uint64_t offset;
     uint64_t size;   /* bytes visible to the guest */
     int readonly;
+    HvDiskFlushMode flush_mode;
 } HvDisk;
 
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly);

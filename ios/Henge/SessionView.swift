@@ -13,6 +13,7 @@ struct SessionView: View {
     @State private var error: String?
     @State private var state: Int32 = 0
     @State private var cpusOn: Int32 = 0
+    @State private var guestRAMMiB: UInt64 = 0
     @State private var userCode = false
     @State private var blocksPerSecond: Double = 0
     @State private var framesOut: UInt64 = 0
@@ -458,6 +459,9 @@ struct SessionView: View {
             List {
                 Section(phase) {
                     LabeledContent("CPUs on", value: "\(cpusOn) of \(cpus)")
+                    if guestRAMMiB > 0 {
+                        LabeledContent("Guest RAM", value: "\(guestRAMMiB) MiB of \(mac.ramMB) MiB requested")
+                    }
                     LabeledContent("iPad thermal", value: Self.thermalLabel(thermalState))
                     LabeledContent("Emulated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
                     LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
@@ -560,20 +564,21 @@ struct SessionView: View {
         }
         var buffer = [CChar](repeating: 0, count: 256)
         sharingActive = Sharing.prepare(enabled: shareFiles)
-        EngineTuning.apply()
+        var tuning = EngineTuning.snapshot()
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         if mac.isRetina {
             henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
         } else {
             henge_vm_set_display_mm(0, 0)
         }
-        HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
+        HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) at \(tuning.refresh_hz) Hz, retina \(mac.isRetina)")
         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus),
-                               Device.isPad ? 1 : 0, &buffer, buffer.count)
+                               Device.isPad ? 1 : 0, &tuning, &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)
             return
         }
+        guestRAMMiB = ram
         started = Date()
         var used = mac
         used.lastUsed = started

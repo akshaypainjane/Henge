@@ -243,6 +243,13 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         return fail(err, errlen, "Cannot set up the JIT region.");
     }
     m.log = c->log;
+    if (c->tuning) {
+        const HvVmTuning *t = c->tuning;
+        disk.flush_mode = aux.flush_mode = t->fast_disk_flush ? HV_DISK_FLUSH_BARRIER : HV_DISK_FLUSH_SYNC;
+        hv_knob[HV_K_WFI_SPIN] = t->idle_spin ? 50 : 0;
+        hv_knob[HV_K_SUPERBLOCKS] = t->superblocks;
+        m.stats_interval = t->stats_interval;
+    }
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
@@ -261,6 +268,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         hv_disk_close(&disk);
         return fail(err, errlen, "The system could not allocate memory for the virtual Mac.");
     }
+    if (c->tuning) hv_pvg_lite_set_refresh_rate(board.pvg, c->tuning->refresh_hz);
     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
     if (c->camera && !c->installer) board.camera = hv_xhci_create_camera(&m, board.pcie);
     hv_vmapple_reset_cpu(&board);
@@ -334,8 +342,8 @@ static void *secondary_thread(void *arg) {
 }
 
 void hv_vm_flush_disks(void) {
-    hv_disk_flush(&disk);
-    hv_disk_flush(&aux);
+    if (hv_disk_flush(&disk) != 0) perror("hengevm: flush root disk");
+    if (hv_disk_flush(&aux) != 0) perror("hengevm: flush auxiliary disk");
 }
 
 int hv_vm_run_cpu0(void) {

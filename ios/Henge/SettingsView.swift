@@ -7,7 +7,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
-    @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
+    @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = false
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
@@ -71,7 +71,7 @@ struct SettingsView: View {
                         Text("120 Hz").tag(120)
                     }
                     .pickerStyle(.segmented)
-                    Toggle("Faster disk writes", isOn: $fastFlush)
+                    Toggle("Faster disk flushes", isOn: $fastFlush)
                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
                     if Entitlements.extendedAddressing {
@@ -86,7 +86,7 @@ struct SettingsView: View {
                         Text("Standard addressing uses a smaller cache to leave room for guest RAM and graphics.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    Text("60 Hz leaves more of the emulated CPU to apps. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
+                    Text("120 Hz requires a built-in display that supports it. Faster disk flushes use write barriers when available. Quicker wake spins for up to 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
