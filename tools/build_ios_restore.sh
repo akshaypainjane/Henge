@@ -62,13 +62,13 @@ compile mbedtls -I"$TP/mbedtls/library" -- "$TP"/mbedtls/library/*.c
 compile plist -I"$TP/libplist/libcnary/include" -DPACKAGE_VERSION='"2.8.0-henge"' -- \
     "$TP"/libplist/src/*.c "$TP"/libplist/libcnary/*.c
 compile glue -DPACKAGE_VERSION='"1.3.3-henge"' -- "$TP"/libimobiledevice-glue/src/*.c
-compile usbmuxdc -DPACKAGE_VERSION='"2.1.1-henge"' -DPACKAGE_STRING='"libusbmuxd"' -- "$TP"/libusbmuxd/src/*.c
+compile usbmuxdc -DHENGE_EMBEDDED -DPACKAGE_VERSION='"2.1.1-henge"' -DPACKAGE_STRING='"libusbmuxd"' -- "$TP"/libusbmuxd/src/*.c
 compile imd -DHAVE_MBEDTLS -DPACKAGE_VERSION='"1.4.0-henge"' -DPACKAGE_STRING='"libimobiledevice"' \
     -I"$TP/libimobiledevice/src" -I"$TP/libimobiledevice/common" -- \
     "$TP"/libimobiledevice/src/*.c "$TP"/libimobiledevice/common/*.c
 compile tatsu -DPACKAGE_VERSION='"1.0.5-henge"' -- "$TP"/libtatsu/src/*.c
 compile irecv -DPACKAGE_VERSION='"1.3.1-henge"' -- "$TP"/libirecovery/src/libirecovery.c
-compile muxd -DPACKAGE_NAME='"usbmuxd"' -DPACKAGE_VERSION='"1.1.1-henge"' -Dmain=usbmuxd_main -Dlog_level=usbmuxd_log_level -- \
+compile muxd -DHENGE_EMBEDDED -DPACKAGE_NAME='"usbmuxd"' -DPACKAGE_VERSION='"1.1.1-henge"' -Dmain=usbmuxd_main -Dlog_level=usbmuxd_log_level -- \
     "$TP"/usbmuxd/src/*.c
 compile idr -I"$TP/idevicerestore/src" -DIDEVICERESTORE_NOMAIN -DPACKAGE_NAME='"idevicerestore"' -DPACKAGE_VERSION='"1.0.0-henge"' -- \
     "$TP"/idevicerestore/src/*.c

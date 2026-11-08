@@ -31,6 +31,7 @@ int config_set_config_dir(const char* path);
 
 void config_get_system_buid(char **system_buid);
 
+int config_valid_record_id(const char *udid);
 int config_has_device_record(const char *udid);
 int config_get_device_record(const char *udid, char **record_data, uint64_t *record_size);
 int config_set_device_record(const char *udid, char* record_data, uint64_t record_size);

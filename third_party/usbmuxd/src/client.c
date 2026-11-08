@@ -191,6 +191,16 @@ int client_accept(int listenfd)
 		return cfd;
 	}
 
+#ifdef HENGE_EMBEDDED
+	/* The restore tools and this server are threads in the same process. */
+	pid_t pid;
+	socklen_t pid_size = sizeof(pid);
+	if (getsockopt(cfd, SOL_LOCAL, LOCAL_PEERPID, &pid, &pid_size) != 0 || pid != getpid()) {
+		close(cfd);
+		return 0;
+	}
+#endif
+
 	int flags = fcntl(cfd, F_GETFL, 0);
 	if (flags < 0) {
 		usbmuxd_log(LL_ERROR, "ERROR: Could not get socket flags!");
@@ -512,6 +522,15 @@ static int send_system_buid(struct mux_client *client, uint32_t tag)
 	return res;
 }
 
+static char *pair_record_id(plist_t request)
+{
+	uint64_t size = 0;
+	const char *id = plist_get_string_ptr(plist_dict_get_item(request, "PairRecordID"), &size);
+	if (!id || strlen(id) != size || !config_valid_record_id(id))
+		return NULL;
+	return strdup(id);
+}
+
 static int send_pair_record(struct mux_client *client, uint32_t tag, const char* record_id)
 {
 	int res = -1;
@@ -756,7 +775,7 @@ static int handle_command(struct mux_client *client, struct usbmuxd_header *hdr)
 					return 0;
 				} else if (!strcmp(message, "ReadPairRecord")) {
 					free(message);
-					char* record_id = plist_dict_get_string_val(dict, "PairRecordID");
+					char* record_id = pair_record_id(dict);
 					plist_free(dict);
 
 					res = send_pair_record(client, hdr->tag, record_id);
@@ -768,7 +787,7 @@ static int handle_command(struct mux_client *client, struct usbmuxd_header *hdr)
 				} else if (!strcmp(message, "SavePairRecord")) {
 					uint32_t rval = RESULT_OK;
 					free(message);
-					char* record_id = plist_dict_get_string_val(dict, "PairRecordID");
+					char* record_id = pair_record_id(dict);
 					char* record_data = NULL;
 					uint64_t record_size = 0;
 					plist_t rdata = plist_dict_get_item(dict, "PairRecordData");
@@ -821,7 +840,7 @@ static int handle_command(struct mux_client *client, struct usbmuxd_header *hdr)
 				} else if (!strcmp(message, "DeletePairRecord")) {
 					uint32_t rval = RESULT_OK;
 					free(message);
-					char* record_id = plist_dict_get_string_val(dict, "PairRecordID");
+					char* record_id = pair_record_id(dict);
 					plist_free(dict);
 					if (record_id) {
 						res = config_remove_device_record(record_id);

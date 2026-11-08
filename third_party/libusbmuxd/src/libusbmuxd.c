@@ -59,6 +59,9 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
+#ifdef HENGE_EMBEDDED
+#include <sys/un.h>
+#endif
 #include <arpa/inet.h>
 #if defined(HAVE_PROGRAM_INVOCATION_SHORT_NAME) && !defined(HAVE_PROGRAM_INVOCATION_SHORT_NAME_ERRNO_H)
 extern char *program_invocation_short_name;
@@ -165,6 +168,10 @@ static int connect_usbmuxd_socket()
 {
 	int res = -1;
 	char *usbmuxd_socket_addr = getenv("USBMUXD_SOCKET_ADDRESS");
+#ifdef HENGE_EMBEDDED
+	if (!usbmuxd_socket_addr || strncmp(usbmuxd_socket_addr, "UNIX:/", 6) != 0)
+		return -EINVAL;
+#endif
 	if (usbmuxd_socket_addr) {
 		if (strncmp(usbmuxd_socket_addr, "UNIX:", 5) == 0) {
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -172,9 +179,16 @@ static int connect_usbmuxd_socket()
 #else
 			if (usbmuxd_socket_addr[5] != '\0') {
 				res = socket_connect_unix(usbmuxd_socket_addr+5);
-				if (res < 0) {
-					res = -errno;
+				if (res < 0)
+					return -errno;
+#ifdef HENGE_EMBEDDED
+				pid_t pid;
+				socklen_t size = sizeof(pid);
+				if (getsockopt(res, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) != 0 || pid != getpid()) {
+					close(res);
+					return -EACCES;
 				}
+#endif
 				return res;
 			}
 #endif

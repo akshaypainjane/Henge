@@ -148,7 +148,7 @@ $(RB)/libirecovery/%.o: third_party/libirecovery/%.c
 	$(CC) $(RESTORE_CFLAGS) -DPACKAGE_VERSION='"1.3.1-henge"' -c $< -o $@
 $(RB)/usbmuxd/%.o: third_party/usbmuxd/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(RESTORE_CFLAGS) -DPACKAGE_NAME='"usbmuxd"' -DPACKAGE_VERSION='"1.1.1-henge"' -Dmain=usbmuxd_main -Dlog_level=usbmuxd_log_level -c $< -o $@
+	$(CC) $(RESTORE_CFLAGS) -DHENGE_EMBEDDED -DPACKAGE_NAME='"usbmuxd"' -DPACKAGE_VERSION='"1.1.1-henge"' -Dmain=usbmuxd_main -Dlog_level=usbmuxd_log_level -c $< -o $@
 $(RB)/idevicerestore/%.o: third_party/idevicerestore/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(RESTORE_CFLAGS) -Ithird_party/idevicerestore/src -DIDEVICERESTORE_NOMAIN -DPACKAGE_NAME='"idevicerestore"' -DPACKAGE_VERSION='"1.0.0-henge"' -c $< -o $@

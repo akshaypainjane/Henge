@@ -14,7 +14,7 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
    as Virtualization.framework's installer does. workdir is scratch space.
    0, or -1 with a reason in err; progress below. */
 int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_t ecid, const char *ipsw,
-                     const char *workdir, uint64_t ram_mb, int cpus, char *err, size_t errlen);
+                     const char *workdir, const char *tempdir, uint64_t ram_mb, int cpus, char *err, size_t errlen);
 /* The restore's step (0 detect, 1 prepare, 2 system image, 3 verify, 4 firmware,
    6 FUD, 7 personalized images; 100 done, 101 failed) and how far it is (0..1). */
 int henge_install_step(void);

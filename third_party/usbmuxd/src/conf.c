@@ -34,7 +34,6 @@
 #include <libgen.h>
 #include <sys/stat.h>
 #include <errno.h>
-#include <ctype.h>
 
 #include <libimobiledevice-glue/utils.h>
 #include <plist/plist.h>
@@ -344,6 +343,12 @@ static int config_set_system_buid(const char *system_buid)
 	return config_set_value(CONFIG_SYSTEM_BUID_KEY, plist_new_string(system_buid));
 }
 
+int config_valid_record_id(const char *udid)
+{
+	return udid && *udid && strcasecmp(udid, "SystemConfiguration") != 0
+		&& udid[strspn(udid, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-")] == '\0';
+}
+
 /**
  * Determines whether a pairing record is present for the given device.
  *
@@ -354,7 +359,7 @@ static int config_set_system_buid(const char *system_buid)
 int config_has_device_record(const char *udid)
 {
 	int res = 0;
-	if (!udid) return 0;
+	if (!config_valid_record_id(udid)) return 0;
 
 	/* ensure config directory exists */
 	if (config_create_config_dir() < 0) {
@@ -423,18 +428,8 @@ int config_set_device_record(const char *udid, char* record_data, uint64_t recor
 {
 	int res = 0;
 
-	if (!udid || !record_data || record_size < 8)
+	if (!config_valid_record_id(udid) || !record_data || record_size < 8)
 		return -EINVAL;
-
-	/* verify udid input */
-	const char* u = udid;
-	while (*u != '\0') {
-		if (!isalnum(*u) && (*u != '-')) {
-			usbmuxd_log(LL_ERROR, "ERROR: %s: udid contains invalid character.\n", __func__);
-			return -EINVAL;
-		}
-		u++;
-	}
 
 	plist_t plist = NULL;
 	plist_from_memory(record_data, record_size, &plist, NULL);
@@ -482,6 +477,8 @@ int config_set_device_record(const char *udid, char* record_data, uint64_t recor
  */
 int config_get_device_record(const char *udid, char **record_data, uint64_t *record_size)
 {
+	if (!config_valid_record_id(udid)) return -EINVAL;
+
 	int res = 0;
 
 	/* ensure config directory exists */
@@ -514,6 +511,8 @@ int config_get_device_record(const char *udid, char **record_data, uint64_t *rec
  */
 int config_remove_device_record(const char *udid)
 {
+	if (!config_valid_record_id(udid)) return -EINVAL;
+
 	int res = 0;
 
 	/* build file path */
@@ -533,6 +532,8 @@ int config_remove_device_record(const char *udid)
 
 static int config_device_record_get_value(const char *udid, const char *key, plist_t *value)
 {
+	if (!config_valid_record_id(udid)) return -EINVAL;
+
 	const char *config_path = NULL;
 	char *config_file = NULL;
 

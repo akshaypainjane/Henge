@@ -46,6 +46,9 @@
 #include <getopt.h>
 #include <pwd.h>
 #include <grp.h>
+#ifdef HENGE_EMBEDDED
+#include <stdatomic.h>
+#endif
 
 #include "log.h"
 #include "usb.h"
@@ -77,6 +80,22 @@ static const char *listen_addr = NULL;
 
 static int report_to_parent = 0;
 
+#ifdef HENGE_EMBEDDED
+static atomic_int stop_requested;
+
+void usbmuxd_stop(void)
+{
+	atomic_store(&stop_requested, 1);
+}
+
+void usbmuxd_prepare(void)
+{
+	atomic_store(&stop_requested, 0);
+	optind = 1;
+	optreset = 1;
+}
+#endif
+
 static int create_socket(void)
 {
 	int listenfd;
@@ -87,7 +106,7 @@ static int create_socket(void)
 	if (listen_addr) {
 		socket_addr = listen_addr;
 	}
-	tcp_port = strrchr(socket_addr, ':');
+	tcp_port = socket_addr[0] == '/' ? NULL : strrchr(socket_addr, ':');
 	if (tcp_port) {
 		tcp_port++;
 		size_t nlen = tcp_port - socket_addr;
@@ -226,7 +245,11 @@ static int create_socket(void)
 			usbmuxd_log(LL_FATAL, "bind() failed: %s", strerror(errno));
 			return -1;
 		}
+#ifdef HENGE_EMBEDDED
+		chmod(socket_addr, 0600);
+#else
 		chmod(socket_addr, 0666);
+#endif
 
 		snprintf(listen_addr_str, sizeof(listen_addr_str), "%s", socket_addr);
 	}
@@ -333,6 +356,12 @@ static int main_loop(int listenfd)
 		usbmuxd_log(LL_FLOOD, "Device timeout is %d ms", dto);
 		if(dto < to)
 			to = dto;
+#ifdef HENGE_EMBEDDED
+		if (atomic_load(&stop_requested))
+			break;
+		if (to < 0 || to > 100)
+			to = 100;
+#endif
 
 		fdlist_reset(&pollfds);
 		fdlist_add(&pollfds, FD_LISTEN, listenfd, POLLIN);
@@ -674,7 +703,7 @@ static void parse_opts(int argc, char **argv)
 
 int main(int argc, char *argv[])
 {
-	int listenfd;
+	int listenfd = -1;
 	int res = 0;
 	int lfd;
 	struct flock lock;
@@ -918,6 +947,8 @@ int main(int argc, char *argv[])
 	usbmuxd_log(LL_NOTICE, "Shutdown complete");
 
 terminate:
+	if (listenfd >= 0)
+		close(listenfd);
 	log_disable_syslog();
 
 	if (res < 0)

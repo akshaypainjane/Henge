@@ -65,7 +65,7 @@ static void on_install_progress(int step, double p, void *user) {
 }
 
 int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_t ecid, const char *ipsw,
-                     const char *workdir, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
+                     const char *workdir, const char *tempdir, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
     if (state) {
         snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
         return -1;
@@ -81,7 +81,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
     if (hv_vm_create(&c, err, errlen) != 0) return -1;
     install_step = 0;
     install_progress = 0;
-    if (hv_install_start(hv_vm_board()->vusb, ipsw, workdir, ecid, on_install_progress, NULL) != 0) {
+    if (hv_install_start(hv_vm_board()->vusb, ipsw, workdir, tempdir, ecid, on_install_progress, NULL) != 0) {
         snprintf(err, errlen, "The installer could not start.");
         return -1;
     }

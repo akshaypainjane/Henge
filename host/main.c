@@ -987,7 +987,7 @@ int main(int argc, char **argv) {
         char work[1024];
         snprintf(work, sizeof work, "%s.restore", disk_path);
         mkdir(work, 0755);
-        if (hv_install_start(board.vusb, install_ipsw, work, ecid, install_progress, NULL) != 0) {
+        if (hv_install_start(board.vusb, install_ipsw, work, "/tmp", ecid, install_progress, NULL) != 0) {
             fprintf(stderr, "hengevm: cannot start the installer\n");
             return 1;
         }

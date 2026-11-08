@@ -193,7 +193,8 @@ final class Installer: NSObject, ObservableObject {
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         var buffer = [CChar](repeating: 0, count: 256)
-        let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
+        let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, NSTemporaryDirectory(),
+                                  ram, Int32(cpus),
                                   &buffer, buffer.count)
         if rc != 0 { throw message(String(cString: buffer)) }
         while true {
