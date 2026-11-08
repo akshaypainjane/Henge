@@ -79,6 +79,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     BOOL guest_backed;
     /* A surface: */
     HvObject *surface;
+    uint32_t video_plane; /* one-based index for a writable NV12 plane view */
     uint64_t row;
     uint32_t first;
     uint32_t surface_w, surface_h, fourcc; /* its own, whatever views the guest makes of it */
@@ -86,8 +87,9 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Multi-plane surfaces use a real IOSurface separate from the guest's pages. */
     IOSurfaceRef iosurface;
     uint64_t alloc, content_hash;
+    __weak id<MTLCommandBuffer> last_surface_use;
     /* When the host cannot lay it out as the guest did: where each plane is on both sides. */
-    uint32_t relaid;
+    uint32_t relaid, plane_count;
     uint64_t plane_from[4], plane_to[4], plane_bytes[4];
     /* A heap: private memory, a buffer over all of it. */
     id<MTLBuffer> heap_whole;
@@ -682,6 +684,7 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
     NSDictionary *props = @{(__bridge id)kIOSurfaceWidth: @(width), (__bridge id)kIOSurfaceHeight: @(height), (__bridge id)kIOSurfacePixelFormat: @(fourcc),
                             (__bridge id)kIOSurfaceAllocSize: @(alloc), (__bridge id)kIOSurfacePlaneInfo: info};
     IOSurfaceRef made = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    to->plane_count = planes;
     if (made) return made;
     /* Video formats refuse a layout with the guest's padding: planes end to end, copied across one by one. */
     NSDictionary *plain_props = @{(__bridge id)kIOSurfaceWidth: @(width), (__bridge id)kIOSurfaceHeight: @(height), (__bridge id)kIOSurfacePixelFormat: @(fourcc), (__bridge id)kIOSurfacePlaneInfo: plain};
@@ -707,11 +710,19 @@ static uint64_t surface_hash(const uint8_t *pixels, uint64_t bytes) {
 }
 
 /* Guest pixels into its IOSurface, when they changed. */
-static void sync_iosurface(HvObject *s) {
+static void sync_iosurface(HvObject *s, id<MTLCommandBuffer> command) {
     if (!s || !s->iosurface || !mapped_range(s, s->first, s->alloc)) return;
+    id<MTLCommandBuffer> previous = s->last_surface_use;
+    if (command && previous == command) return;
+    if (command) s->last_surface_use = command;
     const uint8_t *from = s->mapped + s->first;
     uint64_t hash = surface_hash(from, s->alloc);
     if (hash == s->content_hash) return;
+    /* IOSurfaceLock handles CPU access but does not wait for Metal to finish
+       sampling this texture. Keep the current contents until its last user is done. */
+    MTLCommandBufferStatus status = previous.status;
+    if (status >= MTLCommandBufferStatusCommitted && status < MTLCommandBufferStatusCompleted)
+        [previous waitUntilCompleted];
     if (IOSurfaceLock(s->iosurface, 0, NULL) != KERN_SUCCESS) return;
     uint8_t *base = IOSurfaceGetBaseAddress(s->iosurface);
     size_t bytes = IOSurfaceGetAllocSize(s->iosurface);
@@ -737,6 +748,27 @@ static void sync_iosurface(HvObject *s) {
         FILE *f = fopen(path, "wb");
         if (f) fwrite(from, 1, s->alloc, f), fclose(f);
     }
+}
+
+/* Metal wrote the host IOSurface. Copy its planes before the guest sees the
+   completion stamp, preserving guest metadata and padding outside the planes. */
+static void writeback_iosurface(HvObject *s, uint32_t i) {
+    if (!mapped_range(s, s->first, s->alloc) ||
+        IOSurfaceLock(s->iosurface, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) return;
+    uint8_t *guest = s->mapped + s->first;
+    const uint8_t *host = IOSurfaceGetBaseAddress(s->iosurface);
+    size_t host_bytes = IOSurfaceGetAllocSize(s->iosurface);
+    const uint8_t *plane = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
+    if (host && (uintptr_t)plane >= (uintptr_t)host) {
+        uint64_t guest_offset = s->plane_from[i];
+        uint64_t host_offset = (uintptr_t)plane - (uintptr_t)host;
+        uint64_t bytes = s->plane_bytes[i];
+        if (byte_range(guest_offset, bytes, s->alloc) && byte_range(host_offset, bytes, host_bytes)) {
+            memcpy(guest + guest_offset, plane, bytes);
+            s->content_hash = surface_hash(guest, s->alloc);
+        }
+    }
+    IOSurfaceUnlock(s->iosurface, kIOSurfaceLockReadOnly, NULL);
 }
 
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
@@ -802,12 +834,13 @@ static void sync_iosurface(HvObject *s) {
                 for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
                 [self complain:m];
             }
-            sync_iosurface(surface);
+            sync_iosurface(surface, nil);
         }
         fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
     }
     t.storageMode = MTLStorageModeShared;
     set_framebuffer_only(t, NO);
+    MTLTextureUsage guest_usage = t.usage;
     t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     /* Metal aborts on a swizzled render target, and a surface is always drawn into here: views over it
        (tags 7/8/0x1b) can still swizzle. */
@@ -819,10 +852,31 @@ static void sync_iosurface(HvObject *s) {
     }
     o->surface = surface;
     if (surface->iosurface) {
-        o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:0];
+        size_t plane = 0;
+        if (surface->fourcc == 0x34323076 || surface->fourcc == 0x34323066) { /* 420v, 420f */
+            /* VideoToolbox can write four adjacent bytes of either plane as
+               one texel. Match the view to the plane's row and height. */
+            BOOL packed = t.pixelFormat == MTLPixelFormatR32Uint || t.pixelFormat == MTLPixelFormatRGBA8Unorm;
+            size_t element_bytes = packed ? 4 : t.pixelFormat == MTLPixelFormatR8Unorm ? 1 :
+                                               t.pixelFormat == MTLPixelFormatRG8Unorm ? 2 : 0;
+            for (size_t i = 0; element_bytes && i < surface->plane_count; i++) {
+                size_t width = IOSurfaceGetWidthOfPlane(surface->iosurface, i);
+                size_t bytes = IOSurfaceGetBytesPerElementOfPlane(surface->iosurface, i), row_bytes;
+                if (t.height != IOSurfaceGetHeightOfPlane(surface->iosurface, i) ||
+                    (!packed && bytes != element_bytes) ||
+                    __builtin_mul_overflow(width, bytes, &row_bytes) ||
+                    row_bytes % element_bytes || t.width != row_bytes / element_bytes) continue;
+                plane = i;
+                o->video_plane = (uint32_t)i + 1;
+                break;
+            }
+        }
+        if (o->video_plane) t.usage = guest_usage | MTLTextureUsageShaderRead;
+        o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:plane];
         if (!o->object) { /* video formats cannot be drawn into */
             t.usage = MTLTextureUsageShaderRead;
-            o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:0];
+            o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:plane];
+            o->video_plane = 0;
         }
     }
     else o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
@@ -1826,7 +1880,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
         if (o->mapped) refresh_pages(self, task, o);
-        if (o->surface) sync_iosurface(o->surface);
+        if (o->surface) sync_iosurface(o->surface, cb);
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
@@ -1845,9 +1899,16 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
     [blit endEncoding];
     /* Bit 1: this exec writes it, so the guest's copy is out of date from here on. Never
        upload that over what the GPU drew: mostly zeros, which show as black boxes. */
+    NSMutableSet<HvObject *> *written_planes = nil;
     for (uint32_t i = 0; i < nres; i++)
         if (res[i * 2 + 1] & 2) { /* and what it is made from: a texture in a heap is the heap's bytes */
-            for (HvObject *o = [self object:res[i * 2] task:task]; o; o = o->parent) o->guest_stale = YES;
+            for (HvObject *o = [self object:res[i * 2] task:task]; o; o = o->parent) {
+                o->guest_stale = YES;
+                if (o->video_plane) {
+                    if (!written_planes) written_planes = [NSMutableSet new];
+                    [written_planes addObject:o];
+                }
+            }
         }
     id e = nil; /* the open encoder */
     uint32_t etype = 0;
@@ -1928,7 +1989,13 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
         [back endEncoding];
     }
     double t1 = now_seconds();
-    [self commit:cb channel:ch stamp:stamp complete:YES];
+    [self commit:cb channel:ch stamp:stamp complete:!written_planes];
+    if (written_planes) {
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusCompleted)
+            for (HvObject *view in written_planes) writeback_iosurface(view->surface, view->video_plane - 1);
+        hv_pvg_lite_complete(lite, ch, stamp);
+    }
     double t2 = now_seconds();
     encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
     if (++execs % 2000 == 0) {
