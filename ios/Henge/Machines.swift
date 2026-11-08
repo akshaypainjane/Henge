@@ -52,11 +52,16 @@ enum GuestMemory {
 }
 
 /// machine.json in an exported folder (tools/export_ios.sh writes it).
-private struct MachineFile: Codable {
+struct MachineFile: Codable {
     var name: String?
     var ecid: UInt64
     var seed: UInt64?
     var ramMB: Int?
+
+    static func write(_ mac: VirtualMac, to folder: URL) throws {
+        let info = MachineFile(name: mac.name, ecid: mac.ecid, seed: mac.seed, ramMB: mac.ramMB)
+        try JSONEncoder().encode(info).write(to: folder.appendingPathComponent("machine.json"), options: .atomic)
+    }
 }
 
 @MainActor
@@ -69,7 +74,7 @@ final class Machines: ObservableObject {
 
     /// The files an exported machine folder holds; its disk is disk.img, or disk.img.hvsparse (tools/export_ios.sh packs it).
     static let required = ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json"]
-    static let packedDisk = "disk.img.hvsparse"
+    nonisolated static let packedDisk = "disk.img.hvsparse"
 
     nonisolated static func hasDisk(_ folder: URL) -> Bool {
         return isRegularFile(folder.appendingPathComponent("disk.img"))
@@ -88,20 +93,62 @@ final class Machines: ObservableObject {
     /// The last finished export, ready to be moved out of Henge.
     @Published var lastExport: URL?
 
+    private var registryLoadError: Error?
+
     private init() {
-        load()
-        removeLeftovers()
+        do {
+            try load()
+        } catch {
+            registryLoadError = error
+            report("Could not load the list of Macs. Machine folders were kept", error)
+            return
+        }
+        recoverPendingRegistrations()
     }
 
-    /// Machine folders nothing refers to (an install cut short by a crash or by quitting): their disks take real space.
-    private func removeLeftovers() {
+    /// An unlisted directory can contain a finished Mac. Only recover folders that
+    /// were explicitly marked ready, and leave older or incomplete folders intact.
+    private func recoverPendingRegistrations() {
         let known = Set(all.map(\.id))
-        let items = (try? FileManager.default.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []
-        for item in items {
-            guard let id = UUID(uuidString: item.lastPathComponent), !known.contains(id) else { continue }
-            HengeLog.log("machines", "removing the unfinished machine \(id)")
-            try? FileManager.default.removeItem(at: item)
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        let fm = FileManager.default
+        let folders = (try? fm.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: Array(keys))) ?? []
+        var recovered = [VirtualMac]()
+        var markers = [URL]()
+        for folder in folders {
+            guard let id = UUID(uuidString: folder.lastPathComponent),
+                  folder.lastPathComponent == id.uuidString,
+                  let values = try? folder.resourceValues(forKeys: keys),
+                  values.isDirectory == true, values.isSymbolicLink != true else { continue }
+            let marker = Self.pendingRegistration(in: folder)
+            guard Self.isRegularFile(marker) else { continue }
+            if known.contains(id) {
+                try? fm.removeItem(at: marker) // interrupted just after saving the list
+                continue
+            }
+            do {
+                let mac = try JSONDecoder().decode(VirtualMac.self, from: Data(contentsOf: marker))
+                guard mac.id == id, [mac.disk, mac.rom, mac.aux].allSatisfy(Self.isRegularFile) else {
+                    throw message("The saved identity or required machine files are missing or invalid.")
+                }
+                recovered.append(mac)
+                markers.append(marker)
+            } catch {
+                report("Could not recover Mac \(id). Its files were kept", error)
+            }
         }
+        guard !recovered.isEmpty else { return }
+        do {
+            try save(all + recovered)
+            for marker in markers { try? fm.removeItem(at: marker) }
+            HengeLog.log("machines", "recovered \(recovered.count) unlisted Mac(s)")
+        } catch {
+            report("Could not save the recovered Macs. Their files were kept", error)
+        }
+    }
+
+    private static func pendingRegistration(in folder: URL) -> URL {
+        folder.appendingPathComponent(".pending-registration.json")
     }
 
     nonisolated static var root: URL {
@@ -143,6 +190,7 @@ final class Machines: ObservableObject {
 
     private func adopt(_ folder: URL, move: Bool) async {
         do {
+            if let registryLoadError { throw registryLoadError }
             let missing = Self.required.filter { !Self.isRegularFile(folder.appendingPathComponent($0)) }
             guard missing.isEmpty, Self.hasDisk(folder) else { throw message("The folder is missing \((missing + (Self.hasDisk(folder) ? [] : ["disk.img"])).joined(separator: ", ")).") }
             let data = try Data(contentsOf: folder.appendingPathComponent("machine.json"))
@@ -172,12 +220,10 @@ final class Machines: ObservableObject {
                     }, nil) == 0
                 }.value
                 guard ok else { try? fm.removeItem(at: dest); throw message("The packed disk could not be unpacked (not enough space?).") }
-                if move { try? fm.removeItem(at: packed) }
             }
-            if move { try? fm.removeItem(at: folder) }
             mac.diskBytes = (try? fm.attributesOfItem(atPath: mac.disk.path)[.size] as? Int64) ?? 0
-            all.append(mac)
-            save()
+            try add(mac)
+            if move { try? fm.removeItem(at: folder) }
             HengeLog.log("machines", "imported \(mac.name) (ECID \(mac.ecid), \(mac.diskBytes >> 30) GB disk)")
         } catch {
             lastError = error.localizedDescription
@@ -229,8 +275,7 @@ final class Machines: ObservableObject {
         do {
             try fm.copyItem(at: mac.rom, to: partial.appendingPathComponent("AVPBooter.vmapple2.bin"))
             try fm.copyItem(at: mac.aux, to: partial.appendingPathComponent("auxiliary.bin"))
-            let info: [String: Any] = ["name": mac.name, "ecid": mac.ecid, "seed": mac.seed, "ramMB": mac.ramMB]
-            try JSONSerialization.data(withJSONObject: info).write(to: partial.appendingPathComponent("machine.json"))
+            try MachineFile.write(mac, to: partial)
             let source = mac.disk.path, target = partial.appendingPathComponent(Self.packedDisk).path
             let ok = await Task.detached { () -> Bool in
                 hv_sparse_pack_progress(source, target, { done, total, _ in
@@ -254,23 +299,37 @@ final class Machines: ObservableObject {
         return final
     }
 
-    /// A machine made here (the installer), already in its directory.
-    func add(_ mac: VirtualMac) {
-        all.removeAll { $0.id == mac.id }
-        all.append(mac)
-        save()
+    /// A completed install or import, already in its directory.
+    func add(_ mac: VirtualMac) throws {
+        let marker = Self.pendingRegistration(in: mac.directory)
+        do {
+            try JSONEncoder().encode(mac).write(to: marker, options: .atomic)
+            try save(all.filter { $0.id != mac.id } + [mac])
+            try? FileManager.default.removeItem(at: marker)
+        } catch {
+            report("Could not register \(mac.name). Its files were kept", error)
+            throw message(lastError ?? error.localizedDescription)
+        }
     }
 
     func update(_ mac: VirtualMac) {
         guard let i = all.firstIndex(where: { $0.id == mac.id }) else { return }
-        all[i] = mac
-        save()
+        var list = all
+        list[i] = mac
+        do { try save(list) }
+        catch { report("Could not save changes to \(mac.name)", error) }
     }
 
     func delete(_ id: UUID) {
-        try? FileManager.default.removeItem(at: Self.directory(for: id))
-        all.removeAll { $0.id == id }
-        save()
+        do {
+            if let registryLoadError { throw registryLoadError }
+            do { try FileManager.default.removeItem(at: Self.directory(for: id)) }
+            catch CocoaError.fileNoSuchFile {}
+            all.removeAll { $0.id == id }
+            try save(all)
+        } catch {
+            report("Could not finish removing the Mac", error)
+        }
     }
 
     private var listURL: URL { Self.root.appendingPathComponent("machines.json") }
@@ -285,15 +344,30 @@ final class Machines: ObservableObject {
         try? url.setResourceValues(values)
     }
 
-    private func load() {
-        guard let data = try? Data(contentsOf: listURL), let list = try? JSONDecoder().decode([VirtualMac].self, from: data) else { return }
-        all = list.filter { FileManager.default.fileExists(atPath: $0.disk.path) }
+    private func load() throws {
+        let data: Data
+        do { data = try Data(contentsOf: listURL) }
+        catch CocoaError.fileReadNoSuchFile { return }
+        let list = try JSONDecoder().decode([VirtualMac].self, from: data)
+        all = list.filter { mac in
+            do { return try mac.disk.checkResourceIsReachable() }
+            catch CocoaError.fileReadNoSuchFile { return false }
+            catch { return true }
+        }
     }
 
-    private func save() {
-        try? FileManager.default.createDirectory(at: Self.root, withIntermediateDirectories: true)
+    private func save(_ list: [VirtualMac]) throws {
+        if let registryLoadError { throw registryLoadError }
+        try FileManager.default.createDirectory(at: Self.root, withIntermediateDirectories: true)
         excludeFromBackup()
-        if let data = try? JSONEncoder().encode(all) { try? data.write(to: listURL, options: .atomic) }
+        try JSONEncoder().encode(list).write(to: listURL, options: .atomic)
+        all = list
+    }
+
+    private func report(_ context: String, _ error: Error) {
+        let text = "\(context). \(error.localizedDescription)"
+        lastError = text
+        HengeLog.log("machines", text)
     }
 
     private func message(_ text: String) -> NSError {

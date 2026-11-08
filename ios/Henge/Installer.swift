@@ -96,8 +96,16 @@ final class Installer: NSObject, ObservableObject {
                 mac.osName = release.name
                 made = mac
                 phase = .installing
-                try await install(mac, ipsw: ipsw, cpus: cpus)
-                Machines.shared.add(mac)
+                let work = try await install(mac, ipsw: ipsw, cpus: cpus)
+                // A registration error must never take the completed Mac down the failed-restore path.
+                made = nil
+                do {
+                    defer {
+                        if henge_vm_state() == 1 { henge_vm_stop() }
+                        try? FileManager.default.removeItem(at: work)
+                    }
+                    try Machines.shared.add(mac)
+                }
                 if !keepImage { try? FileManager.default.removeItem(at: ipsw) }
                 HengeLog.log("install", "\(name): installed \(release.name)")
                 phase = .done("\(release.name) is installed on \(name). Quit Henge (swipe it away) and open it again, then tap Start.")
@@ -177,8 +185,7 @@ final class Installer: NSObject, ObservableObject {
         try h.truncate(atOffset: UInt64(64) << 30) // sparse: blocks are only used as macOS writes them
         try h.close()
         guard henge_make_aux(mac.aux.path) == 0 else { throw message("Cannot create the auxiliary storage.") }
-        let info: [String: Any] = ["name": name, "ecid": ecid, "seed": 0, "ramMB": ramMB]
-        try JSONSerialization.data(withJSONObject: info).write(to: mac.directory.appendingPathComponent("machine.json"))
+        try MachineFile.write(mac, to: mac.directory)
         mac.diskBytes = 64 << 30
         HengeLog.log("install", "new machine \(name): ECID \(ecid), 64 GB disk")
         return mac
@@ -186,7 +193,7 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The restore
 
-    private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
+    private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws -> URL {
         guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
         // The restore needs 2 GB, whatever the Mac is set to use afterwards.
         var restoring = mac
@@ -215,8 +222,7 @@ final class Installer: NSObject, ObservableObject {
                 throw message("The machine stopped during the restore (\(String(cString: henge_vm_exit_reason()))).")
             }
         }
-        if henge_vm_state() == 1 { henge_vm_stop() }
-        try? FileManager.default.removeItem(at: work)
+        return work
     }
 
     static func stepName(_ step: Int) -> String {
