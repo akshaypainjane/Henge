@@ -9,6 +9,9 @@ settings:
   base:
     # The app and its JIT helper follow this together (the helper's id sits under the app's).
     HENGE_BUNDLE_IDENTIFIER: com.henge.app
+    # The app's entitlements file. Override on the xcodebuild command line (the JIT helper doesn't use it, so a
+    # personal team can sign the app with fewer entitlements without touching the helper).
+    HENGE_ENTITLEMENTS: Henge/Henge.entitlements
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
     ENABLE_BITCODE: NO
@@ -27,6 +30,7 @@ targets:
           - "Resources/**"
           - "Info.plist"
           - "Henge.entitlements"
+          - "Henge.personal.entitlements"
           - "AppIcon.icon/**"
           - "AppIcon.icon"
       - path: Henge/Resources
@@ -44,7 +48,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
         INFOPLIST_FILE: Henge/Info.plist
-        CODE_SIGN_ENTITLEMENTS: Henge/Henge.entitlements
+        CODE_SIGN_ENTITLEMENTS: $(HENGE_ENTITLEMENTS)
         SWIFT_OBJC_BRIDGING_HEADER: Henge/HengeBridge.h
         TARGETED_DEVICE_FAMILY: "1,2"
         LD_RUNPATH_SEARCH_PATHS:

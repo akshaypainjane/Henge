@@ -19,6 +19,7 @@ typedef struct HvJitRegion {
     intptr_t rw_diff;   /* writable alias = base + rw_diff (bytes), or 0 */
     size_t capacity;    /* in instructions */
     size_t used;        /* in instructions */
+    size_t limit;       /* in instructions; 0: all of it (HV_JIT_CAP: a smaller cache in the same region, to compare) */
     int owned;          /* mapped here (closed here) rather than handed in */
 } HvJitRegion;
 

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- For a free (personal) Apple team, selected with HENGE_ENTITLEMENTS=Henge/Henge.personal.entitlements.
+     A personal team cannot sign extended virtual addressing or dynamic-codesigning, so this holds the
+     two keys of Henge.entitlements it can sign. Their reasons live there. -->
+<dict>
+	<!-- Debugger attach for JIT (Henge.entitlements). -->
+	<key>get-task-allow</key>
+	<true/>
+	<!-- Room for guest RAM and the JIT region (Henge.entitlements). -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

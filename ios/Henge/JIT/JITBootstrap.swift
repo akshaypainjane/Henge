@@ -44,10 +44,16 @@ enum JITBootstrap {
                          + "return 0 instead of killing the process")
     }
 
-    /// Hold one executable code cache per launch. Both views of the cache and
-    /// the translator tables need address space alongside guest RAM and Metal.
-    /// With standard addressing, keep the cache smaller to leave room for them.
-    static let jitBytes = (Entitlements.extendedAddressing ? 1024 : 512) * 1024 * 1024
+    static let codeCacheKey = "henge.perf.codeCacheMB"
+    /// Both JIT mappings and guest RAM need room in the process address space.
+    /// Keep the smaller cache on standard-addressing devices.
+    static let defaultCodeCacheMB: Int = !Entitlements.extendedAddressing ? 512 :
+        (Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536 : 1024)
+    static let jitBytes: Int = {
+        guard Entitlements.extendedAddressing else { return 512 << 20 }
+        let choice = UserDefaults.standard.object(forKey: codeCacheKey) as? Int ?? defaultCodeCacheMB
+        return (choice == 1536 ? 1536 : 1024) << 20
+    }()
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it
@@ -119,8 +125,10 @@ enum JITBootstrap {
             lastFailure = "The debugger is attached but is not answering trap "
                         + "requests, and this device will not execute a MAP_JIT "
                         + "mapping either, so no executable memory could be "
-                        + "claimed. This is what happens when Henge runs inside "
-                        + "another container app rather than sideloaded on its own."
+                        + "claimed. This happens when Henge was opened from StikDebug's "
+                        + "app list, which attaches without Henge's script: open Henge "
+                        + "from the Home Screen and tap Turn On JIT. It also happens "
+                        + "inside another container app."
         }
         HengeLog.log("jit", ok ? "JIT region secured; it will be handed to QEMU later"
                               : "JIT prewarm FAILED -- StikDebug is not servicing traps")
@@ -153,7 +161,11 @@ enum JITBootstrap {
     /// Whether Henge has JIT now: a debugger marked it, or the region is already held. Before iOS 26 this tries, once, to make
     /// the region itself, which is all TrollStore and jailbroken devices need. Cheap after the first call, and logs nothing.
     static var ready: Bool {
-        if debuggedFlag || prewarmed || isLive { return true }
+        if prewarmed || isLive { return true }
+        // On a TXM device the debugger must also answer the brk that claims the region. CS_DEBUGGED alone is what opening
+        // Henge from StikDebug's app list gives (no Henge script) or LiveContainer, and an install then stops at
+        // "Henge has no JIT region" (#23).
+        if debuggedFlag { return !deviceEnforcesTXM }
         guard canGrantOwnJIT, !selfGrantTried else { return false }
         return prewarm()
     }

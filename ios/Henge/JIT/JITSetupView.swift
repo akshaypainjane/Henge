@@ -299,13 +299,13 @@ struct JITSetupFlow: View {
             } else if let error = jit.error {
                 VStack(alignment: .leading, spacing: 10) {
                     outcome(error, ok: false)
-                    if jit.connectionProblem == .pairing {
+                    if jit.advice?.actions.contains(.pairAgain) == true {
                         Button(OnDevicePairing.isSupported ? "Pair again" : "Import a new pairing file") {
                             path = [OnDevicePairing.isSupported ? .pairOnDevice : .importFile]
                         }
                         .font(.system(size: 14, weight: .semibold))
                     }
-                    if jit.connectionProblem != nil {
+                    if jit.advice?.actions.contains(.connectLocalDevVPN) == true {
                         Button(LocalDevVPN.actionTitle) { LocalDevVPN.open() }
                             .font(.system(size: 14, weight: .semibold))
                     }

@@ -74,7 +74,10 @@ typedef struct HvStats {
     uint64_t stash_saves, stash_hits, stash_entries; /* user TLB entries kept across process switches */
     uint64_t code_protects;   /* pages that became code (every CPU's TLB scanned for writable entries) */
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
-    uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
+    uint64_t stash_stale;     /* process switches that found the stash dropped by a TLBI meanwhile */
+    uint64_t slow_why[6];
+    uint64_t small_pages;     /* of the TLB misses above: the guest maps the page with a granule under 16 KB (4 KB), which the TLB cannot hold */
+    struct { uint64_t mb, n; } small_at[8]; /* where (VA >> 20, bit 0 = EL1) the first 8 such regions were */     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
     uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
     uint64_t light_kind[4];
     uint64_t light_fail[4];
@@ -89,8 +92,13 @@ typedef struct HvStats {
     uint64_t posted_kind[4];
     uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
     uint64_t range_spared;    /* big user-range TLBIs that needed no cached targets dropped */
+    uint64_t kernel_ranges;   /* big kernel-range TLBIs, dropped by range rather than with everything */
     uint64_t tlb_range_flushes; /* and that dropped only the TLB entries in the range */     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
+    uint64_t flush_why[8];
+    uint64_t flush_after_switch[4];
+    uint64_t flush_skipped;   /* TLBI all here right after a process switch, left out (HV_SWITCH_FLUSH=1) */ /* TLBI all here, by time since this CPU's last TTBR0 change: <2 us, <20 us, <200 us, later */
+    struct { uint64_t pc, n; } flush_pc[8]; /* where TLBI all here comes from (first 8 PCs seen) */    /* whole-TLB flushes: TLBI all (local), TLBI all (shared), SCTLR, TTBR1, TCR, MAIR, range of everything, requests overflowed */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
     uint64_t miss_kind[7];    /* cache misses by the branch that missed: RET, BR/BLR, B/BL, conditional, MSR, other, unknown */
@@ -174,6 +182,7 @@ typedef struct HvPerCpu {
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
        may be using TLB entries right now. */
     int active, tlb_live;
+    uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
     HvTlbStash stash[HV_STASHES];
@@ -284,7 +293,7 @@ int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
    from the environment variable named in hv_knob_names. */
-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_COUNT };
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
@@ -314,6 +323,7 @@ uint64_t hv_cpu_post(HvCpu *target, uint32_t flags);
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq);
 /* The owner: do what other CPUs asked. */
 void hv_cpu_process_requests(HvCpu *cpu);
+void hv_cpu_ack_wake(HvCpu *cpu);
 void hv_big_lock(HvMachine *m);
 void hv_big_unlock(HvMachine *m);
 /* Let a waiting CPU run (the lock is held again on return). */

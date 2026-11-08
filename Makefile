@@ -97,7 +97,7 @@ $(B)/test_%: tests/test_%.c tests/%_programs.S tests/harness.S tests/harness.h $
 	$(CC) $(CFLAGS) -Itests tests/test_$*.c tests/$*_programs.S tests/harness.S $(ENGINE) -o $@
 
 test: all
-	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
+	@ulimit -s 65520; for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done # a test keeps a whole HvCpu (2 MB of TLB and more) on its stack
 
 $(B):
 	mkdir -p $(B)
@@ -112,10 +112,11 @@ clean:
 # of libslirp and glib from Husk's sysroot (scripts there make them); see ios/README.md.
 IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
-IOS_DEPS ?= $(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot
+# ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
+IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
 IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
@@ -166,6 +167,34 @@ restore-objs: $(RESTORE_OBJ)
 $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
 	xcrun --sdk macosx swiftc $^ -o $@
 
-test-display-routing: $(B)/test_display_targets
+# The router's hand-off to the engine, with the engine call recorded instead of made.
+$(B)/test_display_router: ios/Henge/DisplayRouter.swift ios/Henge/DisplayTargetSelection.swift tests/test_display_router.swift tests/display_engine_stub.h | $(B)
+	xcrun --sdk macosx swiftc -import-objc-header tests/display_engine_stub.h $(filter %.swift,$^) -o $@
+
+# Which external screen shows the Mac before iOS 27, for any order of session and plug events.
+$(B)/test_external_screen_plan: ios/Henge/ExternalScreenPlan.swift tests/test_external_screen_plan.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+# The glue: fake screens and a real router, to check what each screen is told and what the engine draws.
+$(B)/test_legacy_external_display: ios/Henge/LegacyExternalDisplay.swift ios/Henge/ExternalScreenPlan.swift ios/Henge/MacPresentation.swift ios/Henge/DisplayRouter.swift ios/Henge/DisplayTargetSelection.swift tests/test_legacy_external_display.swift tests/display_engine_stub.h | $(B)
+	xcrun --sdk macosx swiftc -import-objc-header tests/display_engine_stub.h $(filter %.swift,$^) -o $@
+
+# Info.plist must declare the external display scene role with ExternalDisplaySceneDelegate, or iOS 17-26 never offer the display.
+$(B)/test_scene_manifest: tests/test_scene_manifest.swift | $(B)
+	xcrun --sdk macosx swiftc -parse-as-library $^ -o $@
+
+test-display-routing: $(B)/test_display_targets $(B)/test_display_router $(B)/test_external_screen_plan $(B)/test_legacy_external_display $(B)/test_scene_manifest
 	$(B)/test_display_targets
+	$(B)/test_display_router
+	$(B)/test_external_screen_plan
+	$(B)/test_legacy_external_display
+	$(B)/test_scene_manifest ios/Henge/Info.plist ios/Henge/ExternalDisplaySceneDelegate.swift
 .PHONY: test-display-routing
+
+# What the JIT setup tells the user and when it retries by itself, for each kind of network path and helper error.
+$(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+test-jit-advice: $(B)/test_jit_advice
+	$(B)/test_jit_advice
+.PHONY: test-jit-advice

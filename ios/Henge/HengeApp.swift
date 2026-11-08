@@ -3,12 +3,16 @@ import AVFAudio
 
 @main
 struct HengeApp: App {
+    /// Answers for external display scenes before iOS 27 (LegacyExternalDisplay.swift).
+    @UIApplicationDelegateAdaptor(HengeAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
         // Order matters: HengeLog takes over stderr, so the engine's and the JIT
         // allocator's first lines land in Documents/henge.log too.
         HengeLog.start()
+        HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")
+        EngineTuning.apply()
         HengeLog.logFootprint("app-launch")
         JITBootstrap.noteLaunchState()
         HengeLog.log("app", "increased memory limit: \(Entitlements.increasedMemory ? "yes" : "no"); extended addressing: \(Entitlements.extendedAddressing ? "yes" : "no"); limit \(Entitlements.memoryLimitAtLaunch >> 20) MB")
@@ -69,6 +73,7 @@ struct RootView: View {
             jit.enableAtLaunchIfAsked()
         }
         .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
+        .task { await Autopilot.run { mac in running = mac } } // testing only: HENGE_AUTOPILOT
     }
 }
 

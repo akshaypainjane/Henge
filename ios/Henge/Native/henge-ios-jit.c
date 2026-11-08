@@ -471,7 +471,7 @@ static HengeDualMapping henge_self_dual_mapping(size_t bytes)
    land in between, which costs nothing until it is touched. It is handed back just before
    the debugger allocates, and the debugger's first-fit allocation takes the hole. */
 #define HENGE_JIT_LOW_LIMIT 0x7000000000ull
-#define HENGE_JIT_HOLD_BYTES ((size_t)1 << 30) /* largest cache JITBootstrap requests */
+#define HENGE_JIT_HOLD_BYTES ((size_t)3 << 29) /* the largest JITBootstrap.jitBytes (1.5 GB); a 1 GB region takes part of the hole */
 __attribute__((used, aligned(16384))) static uint8_t g_jit_reserve[HENGE_JIT_HOLD_BYTES + (16u << 10)];
 static bool g_jit_reserve_released;
 

@@ -1,0 +1,46 @@
+diff --git a/Sources/ScriptRunner.swift b/Sources/ScriptRunner.swift
+index e01b8e5..0021eb4 100644
+--- a/Sources/ScriptRunner.swift
++++ b/Sources/ScriptRunner.swift
+@@ -5,7 +5,8 @@ import JavaScriptCore
+ final class ScriptRunner {
+ 
+     private static let jitPageSize: UInt64 = 16384
+-    private static let jitPageCommandLength = 19
++    private static let jitPageAddressDigits = 16
++    private static let jitPageCommandLength = 2 + jitPageAddressDigits + 8
+     private static let commandsPerBatch = 128
+ 
+     private let targetPID: Int32
+@@ -124,21 +125,22 @@ final class ScriptRunner {
+             buffer[start + 0] = UInt8(ascii: "$")
+             buffer[start + 1] = UInt8(ascii: "M")
+             writeHexAddress(pageAddress, into: &buffer, at: start + 2)
+-            buffer[start + 11] = UInt8(ascii: ",")
+-            buffer[start + 12] = UInt8(ascii: "1")
+-            buffer[start + 13] = UInt8(ascii: ":")
+-            buffer[start + 14] = UInt8(ascii: "6")
+-            buffer[start + 15] = UInt8(ascii: "9")
+-            buffer[start + 16] = UInt8(ascii: "#")
+-            writeChecksum(into: &buffer, bodyStart: start + 1, hashIndex: start + 16)
++            let comma = start + 2 + jitPageAddressDigits
++            buffer[comma + 0] = UInt8(ascii: ",")
++            buffer[comma + 1] = UInt8(ascii: "1")
++            buffer[comma + 2] = UInt8(ascii: ":")
++            buffer[comma + 3] = UInt8(ascii: "6")
++            buffer[comma + 4] = UInt8(ascii: "9")
++            buffer[comma + 5] = UInt8(ascii: "#")
++            writeChecksum(into: &buffer, bodyStart: start + 1, hashIndex: comma + 5)
+         }
+ 
+         return buffer
+     }
+ 
+     private static func writeHexAddress(_ address: UInt64, into buffer: inout [UInt8], at index: Int) {
+-        for nibble in 0..<9 {
+-            let shift = UInt64((8 - nibble) * 4)
++        for nibble in 0..<jitPageAddressDigits {
++            let shift = UInt64((jitPageAddressDigits - 1 - nibble) * 4)
+             buffer[index + nibble] = hexDigit(UInt8((address >> shift) & 0xf))
+         }
+     }

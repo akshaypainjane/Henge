@@ -1,0 +1,25 @@
+format_version: '13'
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+project_type: ios
+
+meta:
+  bitrise.io:
+    stack: osx-xcode-latest-stable
+
+workflows:
+  build_ipa:
+    triggers:
+      push:
+        - branch: codex/fix-ipad-color
+    steps:
+      - git-clone@8: {}
+      - script@1:
+          title: Build Henge IPA
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                bash ci/build-bitrise.sh
+      - deploy-to-bitrise-io@2:
+          inputs:
+            - is_enable_public_page: 'false'

@@ -128,6 +128,21 @@ static __thread Emit E; /* each CPU translates on its own thread, outside the tr
 #define ADD_LSL(d, n, m, sh) (0x8b000000u | (m) << 16 | (sh) << 10 | (n) << 5 | (d))
 #define SUB_X(d, n, m) (0xcb000000u | (m) << 16 | (n) << 5 | (d))
 #define ADD_EXT(d, n, m, opt, sh) (0x8b200000u | (m) << 16 | (opt) << 13 | (sh) << 10 | (n) << 5 | (d))
+
+static void put(Emit *e, uint32_t w);
+
+/* T = where the TLB entry for the page of the address in register va is, for table `table` (0 EL0, 1 EL1, 2 EL1 with PAN),
+   in the layout in force (hv_tlb_tmajor, cpu.h). Returns the offset from T of the entry's first field. */
+static uint32_t put_tlb_slot(Emit *e, int T, int va, int table) {
+    put(e, UBFM_X(T, va, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
+    if (hv_tlb_tmajor) {
+        put(e, ADD_LSL(T, 28, T, 5));
+        if (table) put(e, 0x91400000u | (uint32_t)table * (HV_TLB_SIZE * 32 / 4096) << 10 | (uint32_t)T << 5 | (uint32_t)T); /* add T, T, #table's offset */
+        return HV_CPU_TLB;
+    }
+    put(e, ADD_LSL(T, 28, T, 7));
+    return HV_CPU_TLB + (uint32_t)table * HV_CPU_TLB_EL;
+}
 #define CBNZ_X(t) (0xb5000000u | (t))
 #define CBZ_X(t) (0xb4000000u | (t))
 
@@ -330,7 +345,7 @@ static uint64_t cross_addend(Emit *e, uint64_t target) {
     if (off || !cpu || e->no_ijc || !e->m->chain) return 0;
     /* This CPU's TLB first: an entry there is the mapping now. */
     int table = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
-    const HvTlbEntry *te = &cpu->tlb[(target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][table];
+    const HvTlbEntry *te = hv_tlb_ent(cpu, (target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table);
     uint64_t tpage = target & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     if (te->exec_tag == hv_exec_key(tpage, te->addend)) return (uint64_t)te->addend;
     HvWalk w;
@@ -384,7 +399,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     if (xa) {
         /* The target page's fetch tag: its VA and addend, against what they were. */
         int table = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
-        uint32_t off = HV_CPU_TLB + (((uint32_t)(target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)) << 7) + table * HV_CPU_TLB_EL + 16;
+        uint32_t off = HV_CPU_TLB + hv_tlb_code((uint32_t)(target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table) * (uint32_t)sizeof(HvTlbEntry) + 16;
         put(e, 0x91400000u | (off >> 12) << 10 | 28 << 5 | 7);  /* add x7, x28, #off & ~0xfff */
         put(e, LDR_X(7, 7, off & 0xfff));
         put_lit(e, 15, hv_exec_key(target & ~((1ull << HV_TLB_PAGE_BITS) - 1), (int64_t)xa));
@@ -881,14 +896,20 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         translate_excl(e, insn, pc);
         return;
     }
-    if (e->slow_mem || op.kind == HV_MEM_EXCL || op.kind == HV_MEM_CASP) {
+    /* CASP on the host address, as the guest wrote it, when its two pairs are guest registers that live
+       in their own host registers (pairs must be even and consecutive: no stand-ins). macOS 27 runs tens of
+       thousands a second, and each took the helper. */
+    int casp = op.kind == HV_MEM_CASP;
+    if (casp && (is_stolen(op.rs) || is_stolen(op.rs + 1) || is_stolen(op.rt) || is_stolen((op.rt + 1) & 31))) casp = -1;
+    if (e->slow_mem || op.kind == HV_MEM_EXCL || casp < 0) {
         put_helper(e, pc, insn, HV_OP_MEM);
         return;
     }
+    if (casp) op.align = 1; /* a misaligned one goes to the helper, which raises the alignment fault */
     int literal = op.mode == HV_ADDR_LITERAL;
     int vec_kind = op.kind == HV_MEM_VEC_MULTI || op.kind == HV_MEM_VEC_SINGLE;
     int pair = op.kind == HV_MEM_PAIR;
-    int rmw = op.kind == HV_MEM_CAS || op.kind == HV_MEM_ATOMIC;
+    int rmw = op.kind == HV_MEM_CAS || op.kind == HV_MEM_ATOMIC || casp;
     int rm_used = op.mode == HV_ADDR_REG || (vec_kind && op.mode == HV_ADDR_POST && op.rm != 31);
 
     uint32_t used = 0;
@@ -896,6 +917,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     if (!op.vec) used |= 1u << op.rt | (pair ? 1u << op.rt2 : 0);
     if (rm_used) used |= 1u << op.rm;
     if (rmw) used |= 1u << op.rs;
+    if (casp) used |= 1u << (op.rs + 1) | 1u << op.rt | 1u << ((op.rt + 1) & 31);
     /* Guest x6, x7 and x15 live in the HvCpu: their host registers are as free as ever. */
     if (!hv_knob[HV_K_TEST3]) used &= ~(1u << 6 | 1u << 7 | 1u << 15);
     uint8_t s[3];
@@ -925,9 +947,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         } else {
             ch = op.rn;
         }
-        uint32_t gtlb = HV_CPU_TLB + g_el * HV_CPU_TLB_EL;
-        put(e, UBFM_X(T, ch, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-        put(e, ADD_LSL(T, 28, T, 7));
+        uint32_t gtlb = put_tlb_slot(e, T, ch, g_el);
         put(e, LDR_X(U, T, gtlb + (grp->store ? 8 : 0)));
         put(e, SUB_X(U, ch, U));
         if (len > HV_TLB_ADJ + 1) put_add_imm(e, U, U, len - 1 - HV_TLB_ADJ);
@@ -985,9 +1005,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     int el_idx = g_el;
     uint32_t slow = ~0u;
     if (!role) {
-    uint32_t tlb = HV_CPU_TLB + el_idx * HV_CPU_TLB_EL;
-    put(e, UBFM_X(T, addr, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-    put(e, ADD_LSL(T, 28, T, 7));
+    uint32_t tlb = put_tlb_slot(e, T, addr, el_idx);
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
     put(e, SUB_X(U, addr, U));
     if (op.align && op.bytes > 1) {
@@ -1007,7 +1025,9 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     /* hv_tlb_refill's flags: bit 9 set (so never 0), bit 0 write, bits 2..1 the table, 8..3 bytes - 1 */
     uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;
     put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
-                     .recheck = !(op.align && op.bytes > 1) && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
+                     /* The exact recheck for a page's last 15 bytes costs 6 words in every access's slow path; without it
+                        (HV_RECHECK=0, the default) such an access takes the refill, which sends it to the helper. */
+                     .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                      .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                      .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags});
     slow = e->nool - 1;
@@ -1145,15 +1165,14 @@ static void translate_ic_ivau(Emit *e, uint32_t insn, uint64_t pc) {
     if (is_stolen(rt)) put(e, LDR_X(A, 28, slot_of(rt)));
     else put(e, MOV_X(A, rt)); /* rt 31 is XZR here */
     int el_idx = (e->flags & HV_BLOCK_PAN) ? 2 : 1;
-    put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-    put(e, ADD_LSL(T, 28, T, 7));
-    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 0)); /* read tag */
+    uint32_t tlb = put_tlb_slot(e, T, A, el_idx);
+    put(e, LDR_X(U, T, tlb + 0)); /* read tag */
     put(e, SUB_X(U, A, U));
     put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
     put(e, CBNZ_X(U));
     put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
     uint32_t o1 = e->nool - 1;
-    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 24));
+    put(e, LDR_X(U, T, tlb + 24));
     put(e, ADD_LSL(A, A, U, 0));                                   /* host address */
     put_lit(e, U, (uint64_t)(uintptr_t)ram->host);
     put(e, SUB_X(A, A, U));
@@ -1182,15 +1201,14 @@ static void translate_dc_zva(Emit *e, uint32_t insn, uint64_t pc) {
     else put(e, MOV_X(A, rt)); /* rt 31 is XZR here */
     put(e, 0x92400000u | 58u << 16 | 57u << 10 | A << 5 | A); /* and A, A, #~63 */
     int el_idx = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
-    put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-    put(e, ADD_LSL(T, 28, T, 7));
-    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 8)); /* write tag */
+    uint32_t tlb = put_tlb_slot(e, T, A, el_idx);
+    put(e, LDR_X(U, T, tlb + 8)); /* write tag */
     put(e, SUB_X(U, A, U));
     put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
     put(e, CBNZ_X(U));
     put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
     uint32_t slow = e->nool - 1;
-    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 24));
+    put(e, LDR_X(U, T, tlb + 24));
     put(e, ADD_LSL(A, A, U, 0));
     put(e, 0xd50b7420u | A); /* dc zva, A */
     unspill(e, s, 3);

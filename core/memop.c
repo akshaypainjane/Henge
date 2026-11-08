@@ -301,7 +301,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
         uint64_t pa;
         int had_entry = 0;
         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
-            HvTlbEntry *t = &cpu->tlb[(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][hv_tlb_table(cpu, el)];
+            HvTlbEntry *t = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), hv_tlb_table(cpu, el));
             uint64_t tag = write ? t->write_tag : t->read_tag;
             had_entry = tag != HV_TLB_INVALID && ((va - tag) >> HV_TLB_PAGE_BITS) == 0 ? 1 :
                         tag != HV_TLB_INVALID && ((va - tag - HV_TLB_ADJ) >> HV_TLB_PAGE_BITS) == 0 ? 2 : 0;
@@ -322,6 +322,18 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
             int why = !ram ? 0 : write && ram->code_pages[(pa - ram->pa) >> HV_TLB_PAGE_BITS] ? 1
                     : inpage + len > (1ull << HV_TLB_PAGE_BITS) - HV_TLB_ADJ ? 2 : had_entry == 0 ? 3 : had_entry == 2 ? 5 : 4;
             cpu->m->stats.slow_why[why]++;
+            if (why == 3) { /* a miss the light refill could not fill: a small guest page? */
+                HvWalk w;
+                hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
+                if (!w.fsc && w.block_size < (1ull << HV_TLB_PAGE_BITS)) {
+                    cpu->m->stats.small_pages++;
+                    uint64_t key = (va >> 20) << 1 | (el ? 1 : 0);
+                    for (int i = 0; i < 8; i++) {
+                        if (cpu->m->stats.small_at[i].mb == key) { cpu->m->stats.small_at[i].n++; break; }
+                        if (!cpu->m->stats.small_at[i].mb) { cpu->m->stats.small_at[i].mb = key; cpu->m->stats.small_at[i].n = 1; break; }
+                    }
+                }
+            }
         }
         if (hv_phys_ptr(cpu->m, pa, chunk)) {
             rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);

@@ -19,7 +19,7 @@ extern void hv_xjump_thunk(void);
 static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
-static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3"};
+static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK", "HV_SYNC_WAIT", "HV_SWITCH_FLUSH"};
 
 static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
@@ -52,6 +52,9 @@ int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes) {
 }
 
 static int init_rest(HvMachine *m) {
+    /* The TLB layout (cpu.h): HV_TLBT from the environment here too, so the Mac tool and the tests can pick it. */
+    hv_knob[HV_K_TLBT] = getenv("HV_TLBT") ? atoi(getenv("HV_TLBT")) : 1; /* table-major unless asked: 9-20% faster in 5 of 6 paired rounds of the mix */
+    hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -143,6 +146,25 @@ uint64_t hv_cpu_post(HvCpu *target, uint32_t flags) {
     return post_locked_done(target, p);
 }
 
+/* HV_SYNC_WAIT: a CPU waiting for another's acknowledgement sleeps (after a short spin) instead of
+   spinning and yielding, so a host core is free for the CPU it waits on: the phone has two fast cores
+   for three guest CPUs, the display and the app. The kernel's compare-and-wait on a 32-bit word. */
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#define HV_UL_COMPARE_AND_WAIT 1u
+#define HV_ULF_WAKE_ALL 0x100u
+#define HV_ULF_NO_ERRNO 0x1000000u
+
+/* Wake whoever sleeps on p's ack_seq (it moved, or p stopped using its TLB). */
+static void ack_wake(HvPerCpu *p) {
+    if (__atomic_load_n(&p->ack_waiters, __ATOMIC_SEQ_CST))
+        __ulock_wake(HV_UL_COMPARE_AND_WAIT | HV_ULF_WAKE_ALL | HV_ULF_NO_ERRNO, &p->ack_seq, 0);
+}
+
+void hv_cpu_ack_wake(HvCpu *cpu) {
+    if (cpu->pc_state) ack_wake(cpu->pc_state);
+}
+
 void hv_cpu_process_requests(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     uint64_t seq = __atomic_load_n(&p->req_seq, __ATOMIC_ACQUIRE);
@@ -156,6 +178,7 @@ void hv_cpu_process_requests(HvCpu *cpu) {
     p->nreq = 0;
     pthread_mutex_unlock(&p->req_mu);
     if (flags & HV_REQ_TLB_ALL) {
+        cpu->m->stats.flush_why[7]++;
         hv_tlb_flush(cpu);
     } else {
         for (uint32_t i = 0; i < n; i++) hv_tlbi_apply(cpu, q[i].op1, q[i].crn, q[i].crm, q[i].op2, q[i].xt);
@@ -165,18 +188,32 @@ void hv_cpu_process_requests(HvCpu *cpu) {
         hv_ijc_reset(cpu, 1);
     }
     __atomic_store_n(&p->ack_seq, seq, __ATOMIC_RELEASE);
+    ack_wake(p);
 }
 
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
     HvMachine *mm = target->m;
     uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
-    if (s) __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+    if (s) {
+        __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+        ack_wake(s);
+    }
+    int sleep = hv_knob[HV_K_SYNCWAIT];
     for (uint32_t spins = 0;; spins++) {
-        if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) break;
+        uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
+        if (ack >= seq) break;
         if (!__atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST)) break; /* parked: it does the work before it runs again */
         if (self) hv_cpu_process_requests(self);
-        if (spins > 200) sched_yield();
+        if (sleep && spins >= 64) {
+            __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+            /* Asleep until ack_seq's low word moves or 100 us pass (a missed wake costs no more than that). */
+            if (__atomic_load_n(&t->ack_seq, __ATOMIC_SEQ_CST) == ack && __atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST))
+                __ulock_wait(HV_UL_COMPARE_AND_WAIT | HV_ULF_NO_ERRNO, &t->ack_seq, (uint32_t)ack, 100);
+            __atomic_sub_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+        } else if (spins > 200) {
+            sched_yield();
+        }
     }
     if (s) {
         __atomic_store_n(&s->tlb_live, 1, __ATOMIC_SEQ_CST);
@@ -505,5 +542,6 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->excl_addr = ~0ull;
     /* Architectural reset value has the MMU and caches off; RES1 bits set. */
     cpu->sctlr_el1 = 0x30d00800;
+    cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* nothing is logged yet: make every entry invalid */
     hv_tlb_flush(cpu);
 }

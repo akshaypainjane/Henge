@@ -16,6 +16,15 @@
 #include "translate.h"
 
 void hv_flush_blocks(HvMachine *m) {
+    /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
+    if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
+        hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
+        for (int i = 0; i < m->ncpus; i++)
+            if (m->cpus[i]) {
+                m->cpus[i]->nkernel_fills = HV_KERNEL_FILLS + 1; /* the logs hold slots of the old layout: clear it all */
+                hv_tlb_flush(m->cpus[i]);
+            }
+    }
     m->stats.block_flushes++;
     __atomic_add_fetch(&m->jit_gen, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < m->ncpus; i++)
@@ -30,6 +39,7 @@ void hv_flush_blocks(HvMachine *m) {
     m->nslots = 0;
     m->nxchained = 0;
     hv_jit_reset(&m->jit);
+    m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
     static int poison = -1;
     if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
@@ -48,6 +58,7 @@ static void park(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     __atomic_store_n(&p->tlb_live, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->active, 0, __ATOMIC_SEQ_CST);
+    hv_cpu_ack_wake(cpu); /* a CPU asleep waiting for this one's acknowledgement need not wait any more */
 }
 
 static void unpark(HvCpu *cpu) {
@@ -216,7 +227,7 @@ static uint32_t wfe(HvCpu *cpu) {
     if (spin < 0) spin = getenv("HV_WFE_SPIN") != NULL;
     uint64_t va = cpu->excl_addr;
     uint32_t size = cpu->excl_size;
-    const HvTlbEntry *e = &cpu->tlb[(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][hv_tlb_table(cpu, cpu->el)];
+    const HvTlbEntry *e = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), hv_tlb_table(cpu, cpu->el));
     uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
         e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
@@ -608,6 +619,13 @@ static void print_stats(HvCpu *cpu, int force) {
             last_busy = busy;
         }
         mach_port_deallocate(mach_task_self(), self);
+        fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
+                RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
+                RATE(flush_why[6]), RATE(flush_why[7]));
+        fprintf(stderr, "  TLBI all here/s by time since a TTBR0 change: <2us %.0f, <20us %.0f, <200us %.0f, later %.0f; left out %.0f; at",
+                RATE(flush_after_switch[0]), RATE(flush_after_switch[1]), RATE(flush_after_switch[2]), RATE(flush_after_switch[3]), RATE(flush_skipped));
+        for (int i = 0; i < 8 && s->flush_pc[i].pc; i++) fprintf(stderr, " %llx x%llu", (unsigned long long)s->flush_pc[i].pc, (unsigned long long)s->flush_pc[i].n);
+        fprintf(stderr, "\n");
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
         { /* block hash health: chain lengths and how much of it is stale */
@@ -641,8 +659,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
         fprintf(stderr, "  light lookups failed/s: odd %.0f, filters full %.0f, no mapping %.0f, no block yet %.0f; walked %.0fK/s\n",
                 RATE(light_fail[0]), RATE(light_fail[1]), RATE(light_fail[2]), RATE(light_fail[3]), RATE(light_walks) / 1e3);
-        fprintf(stderr, "  big user-range TLBIs/s: %.0f TLB only in the range, %.0f with no cached targets to drop\n",
-                RATE(tlb_range_flushes), RATE(range_spared));
+        fprintf(stderr, "  big user-range TLBIs/s: %.0f TLB only in the range, %.0f with no cached targets to drop; big kernel ranges %.0f\n",
+                RATE(tlb_range_flushes), RATE(range_spared), RATE(kernel_ranges));
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
         fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]));
@@ -671,13 +689,17 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
                 RATE(ijc_light) / 1e3, RATE(xchained));
-        fprintf(stderr, "  process switches: %.0f/s saved, %.0f/s restored (%.0f entries each)\n", RATE(stash_saves), RATE(stash_hits),
+        fprintf(stderr, "  process switches: %.0f/s saved, %.0f/s restored, %.0f/s dropped by a TLBI (%.0f entries each)\n", RATE(stash_saves), RATE(stash_hits), RATE(stash_stale),
                 s->stash_hits - last.stash_hits ? (double)(s->stash_entries - last.stash_entries) / (s->stash_hits - last.stash_hits) : 0.0);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
                 RATE(tlb_miss_kind[0]) / 1e3, RATE(tlb_miss_kind[1]) / 1e3, RATE(tlb_miss_kind[2]) / 1e3, RATE(tlb_miss_kind[3]) / 1e3);
         fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",
                 RATE(slow_why[0]) / 1e3, RATE(slow_why[1]) / 1e3, RATE(slow_why[2]) / 1e3, RATE(slow_why[3]) / 1e3,
                 RATE(slow_why[4]) / 1e3, RATE(slow_why[5]) / 1e3);
+        fprintf(stderr, "  slow mem on pages mapped under 16 KB: %.0fK/s; at (MB, el)", RATE(small_pages) / 1e3);
+        for (int i = 0; i < 8 && s->small_at[i].mb; i++)
+            fprintf(stderr, " %llx/%d x%llu", (unsigned long long)(s->small_at[i].mb >> 1), (int)(s->small_at[i].mb & 1), (unsigned long long)s->small_at[i].n);
+        fprintf(stderr, "\n");
         fprintf(stderr, "  slow mem K/s: single %.0f pair %.0f literal %.0f ldra %.0f ordered %.0f excl %.0f cas %.0f casp %.0f atomic %.0f vec %.0f/%.0f\n",
                 RATE(slow_kind[0]) / 1e3, RATE(slow_kind[1]) / 1e3, RATE(slow_kind[2]) / 1e3, RATE(slow_kind[3]) / 1e3,
                 RATE(slow_kind[4]) / 1e3, RATE(slow_kind[5]) / 1e3, RATE(slow_kind[6]) / 1e3, RATE(slow_kind[7]) / 1e3,

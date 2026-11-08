@@ -36,6 +36,10 @@ enum HengeLog {
     fileprivate static let crashFrames =
         UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 64)
     private static var pipeWriteFD: Int32 = -1
+    /// HV_LOG_CONSOLE: a copy of the original stderr, so `devicectl device process launch --console` (and Xcode's
+    /// console) can follow the log live. `colorprobe` (any text) mirrors only lines containing it; `all` mirrors everything.
+    private static var consoleFD: Int32 = -1
+    private static var consoleFilter: String?
     private static var started = false
     private static let writeLock = NSLock()
     private static let startTime = Date()
@@ -156,6 +160,10 @@ enum HengeLog {
         }
         log("boot", "native stderr -> henge-native.log (mirrored here)")
 
+        if let mode = ProcessInfo.processInfo.environment["HV_LOG_CONSOLE"], !mode.isEmpty {
+            consoleFD = dup(STDERR_FILENO)
+            consoleFilter = (mode == "all" || mode == "1") ? nil : mode
+        }
         setvbuf(stdout, nil, _IOLBF, 0)
         setvbuf(stderr, nil, _IONBF, 0)
         dup2(pipeWriteFD, STDOUT_FILENO)
@@ -290,6 +298,11 @@ enum HengeLog {
         // Console.app.
         if !fromStream || (!line.contains("[henge-jit]") && !line.contains("[henge-dpy]")) {
             osLog.log("\(line, privacy: .public)")
+        }
+
+        if consoleFD >= 0, consoleFilter == nil || line.contains(consoleFilter!),
+           let console = (line + "\n").data(using: .utf8) {
+            console.withUnsafeBytes { raw in _ = write(consoleFD, raw.baseAddress, raw.count) }
         }
 
         // Written synchronously with write(2) rather than queued. An async write

@@ -19,14 +19,31 @@ struct KeyboardCatcher: UIViewRepresentable {
         let listener = KeyListener()
         let typer = CatcherView()
         var typing = false
+        private var hiding: NSObjectProtocol?
 
         override init(frame: CGRect) {
             super.init(frame: frame)
             addSubview(listener)
             addSubview(typer)
+            hiding = NotificationCenter.default.addObserver(forName: UIResponder.keyboardWillHideNotification,
+                                                            object: nil, queue: .main) { [weak self] _ in
+                self?.keyboardHid()
+            }
         }
 
         required init?(coder: NSCoder) { fatalError("made in code") }
+
+        deinit {
+            if let hiding { NotificationCenter.default.removeObserver(hiding) }
+        }
+
+        /// iPadOS's own hide-keyboard key closes the keyboard without asking the app, which then went on
+        /// keeping the Mac small, with room for a keyboard that was gone. Stop typing as the row's button does.
+        /// A sheet taking the keyboard isn't that: it is handed back when the sheet closes.
+        private func keyboardHid() {
+            guard typing, let window, window.rootViewController?.presentedViewController == nil else { return }
+            typer.onHide()
+        }
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
@@ -44,6 +61,8 @@ struct KeyboardCatcher: UIViewRepresentable {
     /// Whichever view holds the keyboard hears a hardware keyboard's keys here.
     class KeyListener: UIView {
         override var canBecomeFirstResponder: Bool { true }
+        /// Three fingers belong to the session (they show its controls), not to iPadOS's undo/copy/paste bar.
+        override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             let rest = HardwareKeys.send(presses, down: true)
@@ -128,6 +147,13 @@ enum Keys {
         henge_vm_key(code, 1)
         henge_vm_key(code, 0)
         if shifted { henge_vm_key(shift, 0) }
+    }
+
+    /// A letter (or space) with a modifier held.
+    static func chord(_ modifier: UInt16, _ c: Character) {
+        henge_vm_key(modifier, 1)
+        type(c)
+        henge_vm_key(modifier, 0)
     }
 
     /// One character at a time, for what the Mac has to keep up with.

@@ -79,6 +79,7 @@ static ProfBlock prof_blocks[PROF_SLOTS];
 static struct { void *start; const char *name; uint32_t n; } prof_fn[512];
 static int prof_nfn;
 static uint64_t prof_total, prof_idle, prof_el[2], prof_unknown, prof_spin;
+static uint64_t prof_off[12]; /* translated-code samples by words from their block's start: 0..7, 8-15, 16-31, 32+, other */
 /* Per host instruction too, to see where translated code stalls. */
 #define PROF_PCS (1u << 20)
 typedef struct { uint32_t *pc; uint32_t n; } ProfPc;
@@ -113,6 +114,10 @@ static void prof_sample(thread_act_t th) {
         }
         HvBlock *b = &hm->blocks[lo];
         int el = (b->flags & HV_BLOCK_EL1) ? 1 : 0;
+        {
+            ptrdiff_t off = b->code && pc >= b->code ? pc - b->code : -1;
+            prof_off[off < 0 ? 11 : off < 8 ? off : off < 16 ? 8 : off < 32 ? 9 : 10]++;
+        }
         prof_el[el]++;
         if (prof_pcs) {
             uint32_t h = (uint32_t)(((uint64_t)(uintptr_t)pc >> 2) * 0x9e3779b1u) & (PROF_PCS - 1);
@@ -174,6 +179,10 @@ static void prof_dump(const char *path) {
     FILE *f = fopen(path, "w");
     if (f) {
         fprintf(f, "total %llu idle %llu el0 %llu el1 %llu unknown %llu\n", (unsigned long long)prof_total, (unsigned long long)prof_idle, (unsigned long long)prof_el[0], (unsigned long long)prof_el[1], (unsigned long long)prof_unknown);
+        hv_kva_hist_dump(f);
+        fprintf(f, "offsets");
+        for (int k = 0; k < 12; k++) fprintf(f, " %llu", (unsigned long long)prof_off[k]);
+        fprintf(f, "\n");
         { /* the kernel's slide, from where its SHA-256 routine is */
             static const uint8_t sig[] = {0x5f, 0x24, 0x03, 0xd5, 0x03, 0x00, 0x00, 0x90, 0x41, 0x00, 0x00, 0xb5, 0xc0, 0x03, 0x5f, 0xd6, 0x63, 0x00, 0x36, 0x91, 0xe4, 0x43, 0x04, 0xd1, 0xff, 0x43, 0x04, 0xd1, 0x80, 0x28, 0x9f, 0x4c};
             HvVmapple *bd = hv_vm_board();
@@ -196,13 +205,14 @@ static void prof_dump(const char *path) {
                 if (!prof_pcs[i].n || (prof_pcs[i].n < 8 && !(getenv("HV_PROF_PCS") && atoi(getenv("HV_PROF_PCS")) > 1))) continue;
                 fprintf(f, "p %u %llx %08x\n", prof_pcs[i].n, (unsigned long long)(uintptr_t)prof_pcs[i].pc, *prof_pcs[i].pc);
             }
-            (void)pm;
-            /* a window of code around the hottest instructions */
+            /* a window of code around the hottest instructions, kept inside the region */
             for (uint32_t i = 0; i < PROF_PCS; i++) {
                 if (prof_pcs[i].n < 40) continue;
-                uint32_t *c = prof_pcs[i].pc;
-                fprintf(f, "w %llx", (unsigned long long)(uintptr_t)(c - 24));
-                for (int k = -24; k < 8; k++) fprintf(f, " %08x", c[k]);
+                uint32_t *c = prof_pcs[i].pc, *lo = c - 24, *hi = c + 8;
+                if (lo < pm->jit.base) lo = pm->jit.base;
+                if (hi > pm->jit.base + pm->jit.capacity) hi = pm->jit.base + pm->jit.capacity;
+                fprintf(f, "w %llx", (unsigned long long)(uintptr_t)lo);
+                for (uint32_t *k = lo; k < hi; k++) fprintf(f, " %08x", *k);
                 fprintf(f, "\n");
             }
             memset(prof_pcs, 0, PROF_PCS * sizeof prof_pcs[0]);
@@ -212,6 +222,7 @@ static void prof_dump(const char *path) {
     memset(prof_blocks, 0, sizeof prof_blocks);
     for (int i = 0; i < prof_nfn; i++) prof_fn[i].n = 0;
     prof_total = prof_idle = prof_el[0] = prof_el[1] = prof_unknown = prof_spin = 0;
+    memset(prof_off, 0, sizeof prof_off);
     pthread_mutex_unlock(&prof_mu);
 }
 

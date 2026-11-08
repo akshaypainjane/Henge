@@ -6,6 +6,7 @@
 
 #include <os/proc.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "dispatch.h"
@@ -33,6 +34,7 @@ static void on_exit(int reason) {
 
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, int camera, char *err, size_t errlen) {
+    { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
     if (state) {
         snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
         return -1;
@@ -47,6 +49,7 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
     if (hv_vm_create(&c, err, errlen) != 0) return -1;
+    if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
     state = 1;
     hv_vm_start(1, on_exit);
     return 0;
@@ -134,6 +137,9 @@ int henge_vm_state(void) { return state; }
 const char *henge_vm_exit_reason(void) { return hv_vm_reason_name(exit_reason); }
 void henge_vm_stop(void) { if (state == 1) hv_vm_stop(); }
 
+/* Testing (Autopilot.swift): a translation knob, as "knob NAME VALUE" in the Mac tool's input file. */
+int henge_vm_knob(const char *name, int value) { return state == 1 ? hv_knob_set(hv_vm_machine(), name, value) : 0; }
+
 uint64_t henge_vm_blocks(void) { return state ? hv_vm_machine()->stats.blocks : 0; }
 uint32_t henge_vm_jit_generation(void) {
     return state ? __atomic_load_n(&hv_vm_machine()->jit_gen, __ATOMIC_RELAXED) : 0;
@@ -165,6 +171,7 @@ int henge_vm_share(const char *folder, const char *socket_path, const char *agen
 }
 
 void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
+void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
 
 void henge_vm_key(uint16_t code, int down) { if (state == 1) hv_vm_key(code, down); }
 void henge_vm_key_hid(uint8_t usage, int down) { if (state == 1) hv_vm_key_hid(usage, down); }
@@ -196,8 +203,21 @@ int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *
 
 size_t henge_available_memory(void) { return os_proc_available_memory(); }
 
+/* The most address space this app can reserve in one piece, in GB (measuring, for a fastmem window): PROT_NONE
+   reservations cost no memory, and each is given back at once. */
+uint64_t henge_largest_reservation_gb(void) {
+    for (uint64_t gb = 4096; gb >= 4; gb /= 2) {
+        void *p = mmap(NULL, gb << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p != MAP_FAILED) {
+            munmap(p, gb << 30);
+            return gb;
+        }
+    }
+    return 0;
+}
+
 uint64_t henge_largest_mapping_mb(void) {
-    for (uint64_t mb = 16384; mb >= 1024; mb -= 512) {
+    for (uint64_t mb = 16896; mb >= 1024; mb -= 512) { /* 16 GB, the most a Mac can ask for, plus what the caller keeps back */
         void *p = mmap(NULL, mb << 20, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p != MAP_FAILED) {
             munmap(p, mb << 20);

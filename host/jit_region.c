@@ -95,7 +95,8 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
     words = (words + 1) & ~(size_t)1;
     size_t at = __atomic_fetch_add(&region->used, words, __ATOMIC_RELAXED);
-    if (at + words > region->capacity) return NULL; /* full: the flush resets used */
+    size_t cap = region->limit && region->limit < region->capacity ? region->limit : region->capacity;
+    if (at + words > cap) return NULL; /* full: the flush resets used */
     return region->base + at;
 }
 

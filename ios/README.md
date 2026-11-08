@@ -5,7 +5,12 @@ The Henge app on HengeVM's engine. Build: `ios/scripts/package_ipa.sh` (writes
 TrollStore Lite, without the entitlements TrollStore bans). Needs Xcode 27 or later, xcodegen,
 and the prebuilt pieces
 `ios/scripts/fetch_deps.sh` copies from Husk (StikJIT, the pairing library,
-libslirp and glib for iOS).
+libslirp and glib for iOS). `HENGE_ENTITLEMENTS` picks the app's entitlements file
+(default `Henge/Henge.entitlements`). A free personal team uses
+`Henge/Henge.personal.entitlements`: pass it to xcodebuild as a build setting
+(`xcodebuild ... HENGE_ENTITLEMENTS=Henge/Henge.personal.entitlements`, since
+`project.yml` sets it and an environment variable does not override that), and to
+the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/package_ipa.sh`).
 
 - **JIT**: on iOS 26+ (TXM) only an attached debugger can grant executable
   memory. Henge uses the same machinery as Husk: StikDebug, TrollStore, a
@@ -25,19 +30,23 @@ libslirp and glib for iOS).
   [docs/architecture.md](../docs/architecture.md)).
 - **Display**: iOS has no ParavirtualizedGraphics framework, so Henge replays the
   guest's GPU commands with Metal (`devices/pvg_lite.c`, `devices/pvg_metal.m`).
-- **External display (iOS 27+)**: `SessionView` registers a SwiftUI
-  `ExternalNonInteractiveAccessory` during a Mac session. `DisplayRouter` selects
+- **External display**: on iOS 27, `SessionView` registers a SwiftUI
+  `ExternalNonInteractiveAccessory` during a Mac session. On iOS 17–26 iOS offers
+  the display scene to the app delegate instead (`HengeAppDelegate`), and
+  `LegacyExternalDisplay` shows the session there as `ExternalScreenPlan` decides;
+  outside a session the display mirrors the phone. `DisplayRouter` selects
   one live `CAMetalLayer`, preferring the external surface and returning to the
   device on disconnect. The phone's session owns the VM and all input; the
   accessory only presents pixels. The existing guest resolution is unchanged
   (1920×1080 by default on iPhone), fitted to the monitor without stretching.
   USB-C video and a hub's keyboard/mouse can be used together when iOS recognizes
-  the peripherals. iOS 17–26 keep system mirroring; AirPlay may also provide an
-  external scene, with transport-dependent latency. Run `make test-display-routing`
+  the peripherals. AirPlay may also provide an external scene, with
+  transport-dependent latency. Run `make test-display-routing`
   for routing lifecycle checks; `ios/scripts/check_display.sh` also compiles all
   app Swift sources and the iOS/macOS renderer without linking external libraries.
   USB-C video is user-confirmed on an iPhone 17 Pro running iOS 27 with
-  development build 0.1/2; activation is automatic during a Mac session.
+  development build 0.1/2; activation is automatic during a Mac session. The
+  iOS 17–26 path compiles and its plan is tested, but has not run on hardware yet.
   Remaining acceptance checks: connect before/during boot, unplug/replug with an
   idle desktop, rotate the phone, use keyboard/mouse through the dock, and end
   the session while connected. These individual lifecycle cases, other devices

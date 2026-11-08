@@ -1,5 +1,6 @@
 import SwiftUI
 import QuartzCore
+import CoreGraphics
 
 /// The Mac's screen, refreshed a few times a second: what its GPU draws once
 /// macOS is up. Before that, the boot framebuffer, which only ever holds the
@@ -8,9 +9,13 @@ import QuartzCore
 struct BootDisplay: View {
     let display: DisplayRouter
     let role: DisplayTargetSelection.Role
+    /// The id this view's layer connects to the router under.
+    var surface = UUID()
 
     @State private var image: CGImage?
     @State private var gpuLive = false
+    @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
+    @AppStorage("henge.display.brightness") private var screenBrightness = 1.0
 
     var body: some View {
         ZStack {
@@ -29,7 +34,9 @@ struct BootDisplay: View {
                         .foregroundStyle(.white)
                 }
             }
-            GPUScreen(display: display, role: role).allowsHitTesting(false)
+            GPUScreen(display: display, role: role, surface: surface,
+                      matchScreenColors: matchScreenColors, brightness: screenBrightness)
+                .allowsHitTesting(false)
         }
         .task {
             // Once macOS draws with the GPU the frames go straight to GPUScreen:
@@ -64,17 +71,22 @@ struct BootDisplay: View {
 private struct GPUScreen: UIViewRepresentable {
     let display: DisplayRouter
     let role: DisplayTargetSelection.Role
+    let surface: UUID
+    let matchScreenColors: Bool
+    let brightness: Double
+    private static let srgb = CGColorSpace(name: CGColorSpace.sRGB)
 
     final class Screen: UIView {
         override class var layerClass: AnyClass { CAMetalLayer.self }
 
-        private let id = UUID()
+        private let id: UUID
         private let display: DisplayRouter
         private let role: DisplayTargetSelection.Role
         private var attached = false
         private var lastSize: CGSize = .zero
 
-        init(display: DisplayRouter, role: DisplayTargetSelection.Role) {
+        init(display: DisplayRouter, role: DisplayTargetSelection.Role, surface: UUID) {
+            self.id = surface
             self.display = display
             self.role = role
             super.init(frame: .zero)
@@ -116,7 +128,27 @@ private struct GPUScreen: UIViewRepresentable {
         }
     }
 
-    func makeUIView(context: Context) -> Screen { Screen(display: display, role: role) }
-    func updateUIView(_ view: Screen, context: Context) {}
+    private func setColorSpace(_ view: Screen) {
+        let metalLayer = view.layer as! CAMetalLayer
+        // The guest's display profile is sRGB, and the presenter writes sRGB
+        // values. A nil colorspace skips matching on wide-gamut iPad screens.
+        metalLayer.colorspace = matchScreenColors ? Self.srgb : nil
+        view.alpha = CGFloat(min(max(brightness, 0.4), 1))
+    }
+
+    func makeUIView(context: Context) -> Screen {
+        if ProcessInfo.processInfo.environment["HV_COLOR_PROBE"] != nil {
+            // What the screen itself is, for the colour probe (the engine logs the layer and the frames).
+            let s = UIScreen.main
+            let gamut = s.traitCollection.displayGamut == .P3 ? "P3" : s.traitCollection.displayGamut == .SRGB ? "sRGB" : "unspecified"
+            HengeLog.log("colorprobe", "colorprobe: v=1 src=swift event=screen gamut=\(gamut) scale=\(s.scale) nativeScale=\(s.nativeScale) "
+                       + "bounds=\(Int(s.bounds.width))x\(Int(s.bounds.height)) maxEDR=\(s.potentialEDRHeadroom) currentEDR=\(s.currentEDRHeadroom) "
+                       + "brightness=\(String(format: "%.2f", s.brightness)) refreshHz=\(s.maximumFramesPerSecond)")
+        }
+        let view = Screen(display: display, role: role, surface: surface)
+        setColorSpace(view)
+        return view
+    }
+    func updateUIView(_ view: Screen, context: Context) { setColorSpace(view) }
     static func dismantleUIView(_ view: Screen, coordinator: ()) { view.detach() }
 }

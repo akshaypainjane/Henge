@@ -2,6 +2,7 @@
 #define HENGEVM_MMU_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include "cpu.h"
 
@@ -33,6 +34,9 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out);
 void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
+void hv_kva_hist_dump(FILE *f); /* HV_KVA_HIST, see mmu.c */
+/* A big range of kernel VAs: its kernel entries and cached branch targets, not every process's entries. */
+void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len);
 void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len);
 void hv_tlb_switch_user(HvCpu *cpu, uint64_t old_ttbr0, uint64_t new_ttbr0); /* a process switch */
 void hv_tlb_stash_drop(HvCpu *cpu, int asid); /* asid -1: all */
@@ -52,6 +56,7 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
 /* TTBR0 changed: use the new address space's user entries. */
 void hv_ijc_switch(HvCpu *cpu);
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every address space */
+void hv_tlb_flush_va_page(HvCpu *cpu, uint64_t va, int asid); /* one page: stashes lose only its entries */
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
 /* Translated code's TLB miss: walk and fill without the full helper (see mmu.c). */
 int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags);

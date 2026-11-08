@@ -7,7 +7,7 @@ import UIKit
 
 /// How Henge gets a debugger attached. See docs/06-built-in-jit.md.
 enum JITMethod: String, CaseIterable, Identifiable {
-    /// StikDebug when it is installed, then TrollStore, otherwise Built-in StikJIT.
+    /// TrollStore or jailbreak first, then a paired built-in helper or StikDebug.
     case automatic
     case stikDebug
     case trollStore
@@ -131,44 +131,13 @@ enum JITPairingFileStore {
 final class JITCoordinator: ObservableObject {
     static let shared = JITCoordinator()
 
-    /// Why the built-in helper could not reach this device, read from its error.
-    enum ConnectionProblem: Equatable {
-        /// Nothing answered at LocalDevVPN's address: the VPN is off or not routing.
-        case vpn
-        /// The device closed the connection, usually because it no longer accepts
-        /// this pairing (every new pairing replaces the last).
-        case pairing
-
-        init?(helperMessage: String) {
-            let text = helperMessage.lowercased()
-            let has = { (needles: [String]) in needles.contains(where: text.contains) }
-            if has(["connectionreset", "connection reset", "device refused connection"]) {
-                self = .pairing
-            } else if has(["connectionrefused", "connection refused", "timedout", "timed out",
-                           "networkunreachable", "network unreachable", "hostunreachable",
-                           "host unreachable", "no route"]) {
-                self = .vpn
-            } else {
-                return nil
-            }
-        }
-
-        var message: String {
-            switch self {
-            case .vpn:
-                return "Henge couldn't reach this device. Connect LocalDevVPN, then try again."
-            case .pairing:
-                return "This device closed the connection, which usually means it no longer accepts "
-                     + "Henge's pairing. Pair again, and check that LocalDevVPN is connected."
-            }
-        }
-    }
-
     @Published var method: JITMethod {
         didSet { UserDefaults.standard.set(method.rawValue, forKey: "henge.jitMethod") }
     }
     @Published var showSetup = false
-    @Published private(set) var connectionProblem: ConnectionProblem?
+    @Published private(set) var connectionProblem: JITConnectionProblem?
+    /// What to tell the user, and which buttons to offer, for the last connection problem.
+    @Published private(set) var advice: JITAdvice?
     @Published private(set) var busy = false
     @Published private(set) var status: String?
     @Published private(set) var error: String?
@@ -182,16 +151,31 @@ final class JITCoordinator: ObservableObject {
 
     var hasPairing: Bool { pairingSource != nil }
 
+    /// The network path right now. The helper reaches this device through LocalDevVPN, but iOS may send that
+    /// connection over cellular instead; knowing which network is in use decides the advice and the retries.
+    private let pathMonitor = NWPathMonitor()
+
+    var networkSituation: NetworkSituation {
+        let path = pathMonitor.currentPath
+        return NetworkSituation(NetworkPathSnapshot(
+            isSatisfied: path.status == .satisfied,
+            usesWiFi: path.usesInterfaceType(.wifi),
+            usesCellular: path.usesInterfaceType(.cellular),
+            usesWired: path.usesInterfaceType(.wiredEthernet)))
+    }
+
     private init() {
         method = UserDefaults.standard.string(forKey: "henge.jitMethod")
             .flatMap(JITMethod.init(rawValue:)) ?? .automatic
+        pathMonitor.start(queue: DispatchQueue(label: "com.henge.app.jit-path", qos: .utility))
     }
 
     var resolvedMethod: JITMethod {
         guard method == .automatic else { return method }
-        if JITBootstrap.isStikDebugInstalled { return .stikDebug }
         if JITBootstrap.isTrollStoreInstalled { return .trollStore }
         if JITBootstrap.isJailbroken { return .jailbreak }
+        if hasPairing && HengeBuiltInJIT.isAvailable { return .builtIn }
+        if JITBootstrap.isStikDebugInstalled { return .stikDebug }
         return .builtIn
     }
 
@@ -200,7 +184,9 @@ final class JITCoordinator: ObservableObject {
         case .stikDebug: return "StikDebug is installed, so Henge will open it."
         case .trollStore: return "TrollStore is installed, so Henge will ask it to enable JIT."
         case .jailbreak: return "This device is jailbroken, so JIT comes from the jailbreak's Allow JIT in Apps setting."
-        default: return "StikDebug, TrollStore and a jailbreak were not found, so Henge will use its built-in helper."
+        default: return hasPairing
+            ? "Henge will use its paired built-in helper."
+            : "StikDebug, TrollStore and a jailbreak were not found, so Henge will use its built-in helper."
         }
     }
 
@@ -223,7 +209,18 @@ final class JITCoordinator: ObservableObject {
     static let trollStoreAutoKey = "henge.jit.trollStoreAuto"
     static var trollStoreAuto: Bool { UserDefaults.standard.object(forKey: trollStoreAutoKey) as? Bool ?? true }
 
+    /// JIT at launch opened LocalDevVPN to connect it; the next return to the foreground goes on with the built-in helper.
+    private var awaitingVPN = false
+
     func enableAtLaunchIfAsked() {
+        if awaitingVPN {
+            awaitingVPN = false
+            guard !JITBootstrap.ready else { return }
+            log("back from LocalDevVPN (\(LocalDevVPN.isConnected ? "connected" : "not connected")): turning JIT on with built-in StikJIT")
+            method = .builtIn
+            enable()
+            return
+        }
         if !autoTried, JITBootstrap.isInstalledWithTrollStore, Self.trollStoreAuto {
             autoTried = true
             guard !JITBootstrap.ready else { return }
@@ -239,6 +236,14 @@ final class JITCoordinator: ObservableObject {
             log("JIT at launch is on, but built-in StikJIT is not available or not paired; skipped")
             return
         }
+        // The helper reaches this device through LocalDevVPN. When it is not connected, connect it first: LocalDevVPN
+        // connects and comes back (henge://), and the return to the foreground goes on above.
+        if LocalDevVPN.isInstalled, !LocalDevVPN.isConnected {
+            log("JIT at launch: LocalDevVPN is not connected; opening it to connect")
+            awaitingVPN = true
+            LocalDevVPN.open()
+            return
+        }
         log("turning JIT on at launch with built-in StikJIT")
         method = .builtIn
         enable()
@@ -248,6 +253,7 @@ final class JITCoordinator: ObservableObject {
         guard !JITBootstrap.ready else { return }
         error = nil
         connectionProblem = nil
+        advice = nil
         switch resolvedMethod {
         case .automatic:
             assertionFailure("Automatic must resolve to a concrete JIT method")
@@ -357,25 +363,31 @@ final class JITCoordinator: ObservableObject {
         error = nil
     }
 
-    /// Check LocalDevVPN and the Developer Disk Image, mounting it when needed.
-    func prepareBuiltIn() {
+    /// Check LocalDevVPN and the Developer Disk Image, mounting it when needed. `attempt` counts tries; see JITRetryPolicy.
+    func prepareBuiltIn(attempt: Int = 1) {
         guard let pairing = builtInPairing() else { return }
         busy = true
         error = nil
         connectionProblem = nil
-        status = "Checking LocalDevVPN and the Developer Disk Image…"
+        advice = nil
+        if attempt == 1 { status = "Checking LocalDevVPN and the Developer Disk Image…" }
         RemotePairingPortDiscovery.resolve { port in
             HengeBuiltInJIT.send(.prepare(pairingData: pairing, rsdPort: port)) { [weak self] result in
                 guard let self else { return }
-                busy = false
                 switch result {
                 case .success(let response):
+                    log("setup check \(response.success ? "passed" : "failed"): \(response.message)")
+                    if !response.success,
+                       retryIfAdvised(helperMessage: response.message, attempt: attempt, retry: { [weak self] in self?.prepareBuiltIn(attempt: $0) }) {
+                        return
+                    }
+                    busy = false
                     txmPresent = response.txmPresent
                     prepared = response.success
                     status = response.success ? response.message : nil
                     error = response.success ? nil : helperFailure(response.message)
-                    log("setup check \(response.success ? "passed" : "failed"): \(response.message)")
                 case .failure(let failure):
+                    busy = false
                     prepared = false
                     status = nil
                     error = failure.localizedDescription
@@ -384,7 +396,7 @@ final class JITCoordinator: ObservableObject {
         }
     }
 
-    func enableBuiltIn() {
+    func enableBuiltIn(attempt: Int = 1) {
         guard let pairing = builtInPairing() else { return }
         guard let script = JITBootstrap.scriptBase64 else {
             error = "Henge's JIT script is missing from this installation. Reinstall Henge."
@@ -394,8 +406,9 @@ final class JITCoordinator: ObservableObject {
         busy = true
         error = nil
         connectionProblem = nil
-        status = "Starting Henge's JIT helper…"
-        log("enabling JIT with the built-in helper")
+        advice = nil
+        if attempt == 1 { status = "Starting Henge's JIT helper…" }
+        log("enabling JIT with the built-in helper" + (attempt > 1 ? " (attempt \(attempt))" : ""))
         var readiness: Timer?
         var finished = false
         let finish: (String?) -> Void = { [weak self] failure in
@@ -420,7 +433,7 @@ final class JITCoordinator: ObservableObject {
             HengeBuiltInJIT.send(
                 .enable(targetPID: getpid(), pairingData: pairing, scriptBase64: script, rsdPort: port),
                 started: { [weak self] in
-                    self?.status = "Waiting for the helper to attach…"
+                    if attempt == 1 { self?.status = "Waiting for the helper to attach…" }
                     readiness = Self.waitForDebugger { attached in
                         finish(attached ? nil : "The helper did not attach within 90 seconds. "
                                               + "Check that LocalDevVPN is connected, then try again.")
@@ -433,7 +446,16 @@ final class JITCoordinator: ObservableObject {
                         self?.txmPresent = response.txmPresent
                         HengeLog.log("jit", "helper: \(response.message)")
                         if !response.success {
-                            finish(self?.helperFailure(response.message) ?? response.message)
+                            guard let self else { return }
+                            // Not finish(): a retry keeps the screen busy and the next attempt starts its own watch.
+                            if !finished,
+                               retryIfAdvised(helperMessage: response.message, attempt: attempt,
+                                              retry: { [weak self] in self?.enableBuiltIn(attempt: $0) }) {
+                                finished = true
+                                readiness?.invalidate()
+                                return
+                            }
+                            finish(helperFailure(response.message))
                         }
                     case .failure(let failure):
                         finish(failure.localizedDescription)
@@ -474,10 +496,27 @@ final class JITCoordinator: ObservableObject {
     }
 
     /// The helper's failure as shown: a connection problem gets its plain
-    /// explanation (the helper's own message is already in the log).
+    /// explanation for the network in use (the helper's own message is already in the log).
     private func helperFailure(_ message: String) -> String {
-        connectionProblem = ConnectionProblem(helperMessage: message)
-        return connectionProblem?.message ?? message
+        connectionProblem = JITConnectionProblem(helperMessage: message)
+        advice = JITNetworkAdvice.advice(forHelperMessage: message, situation: networkSituation)
+        return advice?.message ?? message
+    }
+
+    /// When the policy says the failure is worth another try, say so, wait, and call `retry` with the next attempt number.
+    /// Returns false when it gives up, and the caller shows the advice instead.
+    private func retryIfAdvised(helperMessage: String, attempt: Int, retry: @escaping (Int) -> Void) -> Bool {
+        guard let problem = JITConnectionProblem(helperMessage: helperMessage),
+              case .retry(let wait) = JITRetryPolicy.decision(situation: networkSituation, problem: problem, attempt: attempt)
+        else { return false }
+        status = JITRetryPolicy.statusText(nextAttempt: attempt + 1)
+        log("helper could not connect (attempt \(attempt)); retrying in \(Int(wait))s")
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard self != nil else { return }
+            retry(attempt + 1)
+        }
+        return true
     }
 
     /// Polls CS_DEBUGGED until it is set or `timeout` passes.
@@ -506,6 +545,24 @@ enum LocalDevVPN {
     static let connect = URL(string: "localdevvpn://enable?scheme=henge")!
 
     static var isInstalled: Bool { UIApplication.shared.canOpenURL(URL(string: "localdevvpn://")!) }
+
+    /// Whether its tunnel is up: a tunnel interface that is up with an address in 10.7.0.0/16 (LocalDevVPN's own is
+    /// 10.7.1.1), the network it routes to reach this device at 10.7.0.1, StikJIT's default device address.
+    static var isConnected: Bool {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return false }
+        defer { freeifaddrs(list) }
+        for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = p.pointee
+            guard (ifa.ifa_flags & UInt32(IFF_UP)) != 0, let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+            if ip >> 16 == 0x0a07, String(cString: ifa.ifa_name).hasPrefix("utun") {
+                HengeLog.log("jit", "LocalDevVPN tunnel on \(String(cString: ifa.ifa_name))")
+                return true
+            }
+        }
+        return false
+    }
     static var actionTitle: String { isInstalled ? "Connect LocalDevVPN" : "Get LocalDevVPN" }
 
     @MainActor static func open() {

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Henge colour test</title>
+<style>
+  /* Flat, exact CSS colours in a fixed grid, so the probe can find each swatch by position and read the bytes it was drawn with.
+     Zoom must stay at 100%. Nothing here has gradients, shadows or transparency. */
+  html, body { margin: 0; background: #000; color: #fff; font: 13px -apple-system, Helvetica, sans-serif; }
+  h1 { font-size: 15px; margin: 10px 12px 4px; font-weight: 600; }
+  p { margin: 0 12px 6px; color: #bbb; }
+  .row { display: flex; margin: 0 12px 10px; }
+  .sw { width: 72px; margin-right: 6px; }
+  .sw i { display: block; width: 72px; height: 72px; }
+  .sw b { display: block; font: 11px ui-monospace, Menlo, monospace; text-align: center; padding-top: 2px; color: #ddd; font-weight: 400; }
+  .band { height: 90px; margin: 0 12px 10px; }
+</style>
+</head>
+<body>
+<h1>Henge colour test: 100% zoom, nothing selected</h1>
+<p>Row 1: grey ramp, CSS values 0..255. Row 2: primaries, secondaries, white. Row 3: mid tones. Then big flat bands.</p>
+
+<div class="row" id="r1"></div>
+<div class="row" id="r2"></div>
+<div class="row" id="r3"></div>
+<div class="band" style="background:#808080"></div>
+<div class="band" style="background:#ffffff"></div>
+<div class="band" style="background:#ff0000"></div>
+
+<script>
+  function row(id, list) {
+    const el = document.getElementById(id);
+    for (const [css, label] of list) {
+      const d = document.createElement('div'); d.className = 'sw';
+      d.innerHTML = '<i style="background:' + css + '"></i><b>' + label + '</b>';
+      el.appendChild(d);
+    }
+  }
+  const ramp = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255]
+    .map(v => ['rgb(' + v + ',' + v + ',' + v + ')', v.toString(16).padStart(2, '0').repeat(3)]);
+  row('r1', ramp.slice(0, 5));
+  document.getElementById('r1').insertAdjacentHTML('afterend', '<div class="row" id="r1b"></div><div class="row" id="r1c"></div><div class="row" id="r1d"></div>');
+  row('r1b', ramp.slice(5, 10)); row('r1c', ramp.slice(10, 15)); row('r1d', ramp.slice(15));
+  row('r2', [['#ff0000', 'ff0000'], ['#00ff00', '00ff00'], ['#0000ff', '0000ff'], ['#00ffff', '00ffff'], ['#ff00ff', 'ff00ff']]);
+  row('r3', [['#ffff00', 'ffff00'], ['#ffffff', 'ffffff'], ['#ff8000', 'ff8000'], ['#8000ff', '8000ff'], ['#0080ff', '0080ff']]);
+</script>
+</body>
+</html>
