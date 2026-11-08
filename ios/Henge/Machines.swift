@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import UIKit
 
@@ -64,9 +65,13 @@ final class Machines: ObservableObject {
     static let packedDisk = "disk.img.hvsparse"
 
     nonisolated static func hasDisk(_ folder: URL) -> Bool {
-        let fm = FileManager.default
-        return fm.fileExists(atPath: folder.appendingPathComponent("disk.img").path)
-            || fm.fileExists(atPath: folder.appendingPathComponent(packedDisk).path)
+        return isRegularFile(folder.appendingPathComponent("disk.img"))
+            || isRegularFile(folder.appendingPathComponent(packedDisk))
+    }
+
+    nonisolated private static func isRegularFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return false }
+        return values.isRegularFile == true && values.isSymbolicLink != true
     }
 
     @Published private(set) var unpacked: Double = 0
@@ -107,8 +112,15 @@ final class Machines: ObservableObject {
     }
 
     private func collect() async {
-        guard importing == nil, let items = try? FileManager.default.contentsOfDirectory(at: Self.inbox, includingPropertiesForKeys: nil) else { return }
-        for folder in items where Self.hasDisk(folder) && Self.required.allSatisfy({ FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }) {
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        guard importing == nil, let items = try? FileManager.default.contentsOfDirectory(at: Self.inbox, includingPropertiesForKeys: Array(keys)) else { return }
+        for folder in items {
+            guard folder.lastPathComponent.caseInsensitiveCompare("Shared") != .orderedSame,
+                  folder.lastPathComponent.caseInsensitiveCompare("Exports") != .orderedSame,
+                  let values = try? folder.resourceValues(forKeys: keys),
+                  values.isDirectory == true, values.isSymbolicLink != true,
+                  Self.hasDisk(folder),
+                  Self.required.allSatisfy({ Self.isRegularFile(folder.appendingPathComponent($0)) }) else { continue }
             await adopt(folder, move: true)
         }
     }
@@ -124,10 +136,10 @@ final class Machines: ObservableObject {
 
     private func adopt(_ folder: URL, move: Bool) async {
         do {
+            let missing = Self.required.filter { !Self.isRegularFile(folder.appendingPathComponent($0)) }
+            guard missing.isEmpty, Self.hasDisk(folder) else { throw message("The folder is missing \((missing + (Self.hasDisk(folder) ? [] : ["disk.img"])).joined(separator: ", ")).") }
             let data = try Data(contentsOf: folder.appendingPathComponent("machine.json"))
             let info = try JSONDecoder().decode(MachineFile.self, from: data)
-            let missing = Self.required.filter { !FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }
-            guard missing.isEmpty, Self.hasDisk(folder) else { throw message("The folder is missing \((missing + (Self.hasDisk(folder) ? [] : ["disk.img"])).joined(separator: ", ")).") }
             var mac = VirtualMac(name: info.name ?? folder.lastPathComponent, ecid: info.ecid, seed: info.seed ?? 0,
                                  ramMB: info.ramMB ?? 2048, diskBytes: 0)
             importing = mac.name
@@ -138,12 +150,12 @@ final class Machines: ObservableObject {
             excludeFromBackup()
             for name in ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json", "disk.img"] {
                 let from = folder.appendingPathComponent(name)
-                guard fm.fileExists(atPath: from.path) else { continue }
+                guard Self.isRegularFile(from) else { continue }
                 if move { try fm.moveItem(at: from, to: dest.appendingPathComponent(name)) }
                 else { try fm.copyItem(at: from, to: dest.appendingPathComponent(name)) }
             }
             let packed = folder.appendingPathComponent(Self.packedDisk)
-            if fm.fileExists(atPath: packed.path) {
+            if Self.isRegularFile(packed) {
                 // Off the main thread: unpacking tens of gigabytes takes minutes.
                 let target = mac.disk.path, source = packed.path
                 let ok = await Task.detached { () -> Bool in
@@ -192,19 +204,21 @@ final class Machines: ObservableObject {
     private func writeExport(_ mac: VirtualMac) async throws -> URL {
         let fm = FileManager.default
         let exports = Self.inbox.appendingPathComponent("Exports", isDirectory: true)
-        let safeName = mac.name.replacingOccurrences(of: "/", with: "-")
-        let final = exports.appendingPathComponent(safeName, isDirectory: true)
+        let final = exports.appendingPathComponent(mac.id.uuidString, isDirectory: true)
         // Not under its final name until it is whole, so a cut-short export can't be mistaken for a Mac.
-        let partial = exports.appendingPathComponent(safeName + ".partial", isDirectory: true)
-        try? fm.removeItem(at: partial)
-        try? fm.removeItem(at: final)
+        let partial = exports.appendingPathComponent(".partial-" + UUID().uuidString, isDirectory: true)
         let used = (try? mac.disk.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0
         let free = (try? Self.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage ?? 0
         let needed = Int64(used) + (256 << 20)
         if free > 0 && free < needed {
             throw message("Exporting \(mac.name) needs about \(ByteText.string(UInt64(needed))) free; this \(Device.name) has \(ByteText.string(UInt64(free))). Deleting a downloaded macOS installer (Install macOS, swipe it) frees about 16 GB.")
         }
-        try fm.createDirectory(at: partial, withIntermediateDirectories: true)
+        try fm.createDirectory(at: exports, withIntermediateDirectories: true)
+        let properties = try exports.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard properties.isDirectory == true, properties.isSymbolicLink != true else {
+            throw message("The Exports folder is not a directory in Henge.")
+        }
+        try fm.createDirectory(at: partial, withIntermediateDirectories: false)
         do {
             try fm.copyItem(at: mac.rom, to: partial.appendingPathComponent("AVPBooter.vmapple2.bin"))
             try fm.copyItem(at: mac.aux, to: partial.appendingPathComponent("auxiliary.bin"))
@@ -218,7 +232,13 @@ final class Machines: ObservableObject {
                 }, nil) == 0
             }.value
             guard ok else { throw message("The disk could not be written (not enough space?).") }
-            try fm.moveItem(at: partial, to: final)
+            // Keep the last complete export until its replacement is ready.
+            if renamex_np(partial.path, final.path, UInt32(RENAME_EXCL)) != 0 {
+                guard errno == EEXIST, renamex_np(partial.path, final.path, UInt32(RENAME_SWAP)) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                try? fm.removeItem(at: partial)
+            }
         } catch {
             try? fm.removeItem(at: partial)
             throw error
