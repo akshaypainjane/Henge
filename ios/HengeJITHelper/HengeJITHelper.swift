@@ -33,8 +33,8 @@ private enum HengeJITWork {
                 throw NSError(domain: "HengeJITHelper", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "The pairing file was not provided."])
             }
-            let pairingURL = root.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
-            try pairingData.write(to: pairingURL, options: .atomic)
+            let pairingURL = manager.temporaryDirectory.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
+            try pairingData.write(to: pairingURL, options: [.atomic, .completeFileProtection])
             defer { try? manager.removeItem(at: pairingURL) }
 
             switch request.operation {

@@ -235,7 +235,7 @@ struct JITSetupFlow: View {
                 point(3, "Tap **Choose pairing file** and pick it.", done: jit.pairingSource == .imported)
             }
             .padding(16).hengeCard()
-            Label("The pairing file stays in Henge's Documents folder and is only sent to Henge's own helper.",
+            Label("Henge stores its copy privately and only sends it to its built-in JIT helper.",
                   systemImage: "lock.fill")
                 .font(.system(size: 13)).foregroundStyle(Theme.textDim)
             if let error = jit.error { outcome(error, ok: false) }

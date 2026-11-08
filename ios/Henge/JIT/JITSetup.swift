@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+import Darwin
 import Foundation
 import Network
 import SwiftUI
@@ -33,24 +34,30 @@ enum JITPairingSource: String {
     case imported
 }
 
-/// The RPPairing file Built-in StikJIT authenticates with. Lives in Documents,
-/// so it is visible through Finder file sharing -- it is device-sensitive and
-/// is only ever sent to Henge's own helper process.
+/// The device credential for Built-in StikJIT. Keep it out of Files, Finder and backups.
 enum JITPairingFileStore {
-    static var directory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    private static var directory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("StikJIT", isDirectory: true)
     }
-    static var url: URL { directory.appendingPathComponent("pairingFile.plist") }
-    static var exists: Bool { FileManager.default.fileExists(atPath: url.path) }
+    private static var url: URL { directory.appendingPathComponent("pairingFile.plist") }
+    private static var legacyURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("StikJIT", isDirectory: true)
+            .appendingPathComponent("pairingFile.plist")
+    }
     private static let sourceKey = "henge.jitPairingSource"
 
     static var source: JITPairingSource? {
-        guard exists else { return nil }
+        try? migrate()
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         return UserDefaults.standard.string(forKey: sourceKey).flatMap(JITPairingSource.init(rawValue:)) ?? .imported
     }
 
-    static func data() throws -> Data { try Data(contentsOf: url) }
+    static func data() throws -> Data {
+        try migrate()
+        return try Data(contentsOf: url)
+    }
 
     static func importFile(from source: URL) throws {
         let scoped = source.startAccessingSecurityScopedResource()
@@ -60,19 +67,63 @@ enum JITPairingFileStore {
 
     /// Validates an RPPairing plist and makes it the pairing file.
     static func store(_ data: Data, source: JITPairingSource) throws {
-        guard !data.isEmpty,
+        try writePrivate(data)
+        UserDefaults.standard.set(source.rawValue, forKey: sourceKey)
+        removeLegacy()
+    }
+
+    private static func migrate() throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            removeLegacy() // Retry if a prior launch stopped after writing the private copy.
+            return
+        }
+        let old = legacyURL
+        guard FileManager.default.fileExists(atPath: old.path) else { return }
+        try writePrivate(readLegacy(old))
+        removeLegacy()
+    }
+
+    private static let maximumPairingBytes = 1024 * 1024
+
+    private static func readLegacy(_ old: URL) throws -> Data {
+        let parent = try old.deletingLastPathComponent().resourceValues(forKeys: [.isSymbolicLinkKey])
+        let file = try old.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard parent.isSymbolicLink != true, file.isRegularFile == true, file.isSymbolicLink != true,
+              let size = file.fileSize, size > 0, size <= maximumPairingBytes else {
+            throw CocoaError(.fileReadNoPermission)
+        }
+        return try Data(contentsOf: old)
+    }
+
+    private static func removeLegacy() {
+        let old = legacyURL
+        guard let data = try? readLegacy(old), isPairingFile(data) else { return }
+        // This may only unlink a file, even if the legacy name changes during cleanup.
+        _ = unlink(old.path)
+    }
+
+    private static func isPairingFile(_ data: Data) -> Bool {
+        guard !data.isEmpty, data.count <= maximumPairingBytes,
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
               let dictionary = plist as? [String: Any],
               let publicKey = dictionary["public_key"] as? Data, publicKey.count == 32,
               let privateKey = dictionary["private_key"] as? Data, privateKey.count == 32,
-              let identifier = dictionary["identifier"] as? String, !identifier.isEmpty else {
+              let identifier = dictionary["identifier"] as? String, !identifier.isEmpty else { return false }
+        return true
+    }
+
+    private static func writePrivate(_ data: Data) throws {
+        guard isPairingFile(data) else {
             throw NSError(domain: "HengeJIT", code: 10,
                           userInfo: [NSLocalizedDescriptionKey:
                             "That is not a remote pairing file. Make one with the StikDebug pairing-file guide and try again."])
         }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try data.write(to: url, options: .atomic)
-        UserDefaults.standard.set(source.rawValue, forKey: sourceKey)
+        var folder = directory
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try folder.setResourceValues(values)
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
     }
 }
 
