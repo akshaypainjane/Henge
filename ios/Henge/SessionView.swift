@@ -99,6 +99,7 @@ struct SessionView: View {
         }
         .onChange(of: pointerNeeded) { PointerLock.set(!$0) }
         .onChange(of: scenePhase) { phase in
+            HengeLog.log("session", "scene became \(phase)")
             guard phase != .active else {
                 display.refresh()
                 return
@@ -381,7 +382,7 @@ struct SessionView: View {
             List {
                 Section(phase) {
                     LabeledContent("CPUs on", value: "\(cpusOn) of \(cpus)")
-                    LabeledContent("Translated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
+                    LabeledContent("Emulated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
                     LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                 }
@@ -438,18 +439,40 @@ struct SessionView: View {
         Machines.shared.update(used)
         var lastBlocks = henge_vm_blocks()
         var lastTime = Date()
+        var sampleTime = lastTime
+        var sampleBlocks = lastBlocks
+        var sampleFrames = henge_vm_gpu_frames()
+        var sampleGeneration = henge_vm_jit_generation()
         var tick = 0
         while !Task.isCancelled {
             state = henge_vm_state()
             cpusOn = henge_vm_cpus_on()
             userCode = userCode || henge_vm_guest_el0() != 0
             let now = Date(), blocks = henge_vm_blocks()
-            blocksPerSecond = Double(blocks &- lastBlocks) / max(now.timeIntervalSince(lastTime), 0.001)
+            let interval = now.timeIntervalSince(lastTime)
+            blocksPerSecond = Double(blocks &- lastBlocks) / max(interval, 0.001)
+            if interval > 3 || now.timeIntervalSince(sampleTime) >= 10 {
+                let frames = henge_vm_gpu_frames()
+                let generation = henge_vm_jit_generation()
+                if interval <= 3 {
+                    let elapsed = now.timeIntervalSince(sampleTime)
+                    let throughput = String(format: "%.2f", Double(blocks &- sampleBlocks) / elapsed / 1e6)
+                    let presentation = String(format: "%.1f", Double(frames &- sampleFrames) / elapsed)
+                    let thermal = ProcessInfo.processInfo.thermalState
+                    HengeLog.log("performance", "\(throughput) M blocks/s, \(presentation) frame submissions/s, " +
+                                 "\(generation &- sampleGeneration) JIT cache resets, thermal \(thermal), " +
+                                 "\(henge_available_memory() >> 20) MiB app headroom")
+                }
+                sampleTime = now
+                sampleBlocks = blocks
+                sampleFrames = frames
+                sampleGeneration = generation
+            }
             lastBlocks = blocks
             lastTime = now
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
-            log = Array(HengeLog.recentLines(200))
+            if showDetails { log = Array(HengeLog.recentLines(200)) }
             if state == 2 { break }
             tick += 1
             if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report

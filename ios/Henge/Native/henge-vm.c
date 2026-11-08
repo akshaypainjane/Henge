@@ -109,6 +109,9 @@ const char *henge_vm_exit_reason(void) { return hv_vm_reason_name(exit_reason); 
 void henge_vm_stop(void) { if (state == 1) hv_vm_stop(); }
 
 uint64_t henge_vm_blocks(void) { return state ? hv_vm_machine()->stats.blocks : 0; }
+uint32_t henge_vm_jit_generation(void) {
+    return state ? __atomic_load_n(&hv_vm_machine()->jit_gen, __ATOMIC_RELAXED) : 0;
+}
 uint64_t henge_vm_net_frames(int sent) { return sent ? hv_net_tx_frames : hv_net_rx_frames; }
 
 int henge_vm_cpus_on(void) {

@@ -29,7 +29,8 @@ const char *henge_vm_exit_reason(void);
 void henge_vm_stop(void);
 
 /* Progress, for the session screen. */
-uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
+uint64_t henge_vm_blocks(void);                    /* blocks the CPUs entered */
+uint32_t henge_vm_jit_generation(void);            /* full code cache resets */
 uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
 int henge_vm_cpus_on(void);                /* CPUs the guest has started */
 int henge_vm_guest_el0(void);              /* any CPU running user code right now */
