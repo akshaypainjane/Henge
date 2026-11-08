@@ -75,7 +75,15 @@ To automate a Debug launch, copy a complete UTF-8 plan into
 `Library/Caches/henge-autopilot.txt` in the app container with `devicectl`, then
 launch with `HENGE_AUTOPILOT=1`. The app consumes the plan once. Commands are
 `mac [NAME]`, `wait SECONDS` (up to 300 seconds), `type TEXT`, `key CODE`,
-`cmd KEY`, `log`, `stop`, and `exit`. The plan is limited to 64 KiB and 256 commands.
+`cmd KEY`, `pointer`, `move X Y`, `click X Y`, `snap [NAME]`, `log`, `stop`, and
+`exit`. The plan is limited to 64 KiB and 256 commands.
+
+Pointer coordinates are in guest display pixels. A click is sent only after
+the guest reports arrival within two pixels on each axis. A failed move or click
+stops the plan. After starting a Mac, `snap` saves a JPEG to
+`Library/Caches/henge-snap-NAME.jpg` (default name `snap`). Names can contain
+up to 64 ASCII letters, digits, hyphens, and underscores. The session disables
+screen saving when the iPad camera is shared.
 
 Use `tools/colorprobe/probe.sh` for the color probe. It stores captures in the
 app's cache. Restart without frame capture flags to use the iPad camera.

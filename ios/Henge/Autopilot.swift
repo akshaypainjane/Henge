@@ -12,6 +12,9 @@ enum Autopilot {
         case type(String)
         case key(UInt16)
         case chord(Character)
+        case pointer
+        case move(x: Int32, y: Int32, click: Bool)
+        case snap(String)
         case mark
         case stop
         case exit
@@ -20,6 +23,20 @@ enum Autopilot {
     struct InvalidPlan: LocalizedError {
         let line: Int
         var errorDescription: String? { "Invalid automation command on line \(line)." }
+    }
+
+    enum ExecutionError: LocalizedError {
+        case pointerUnavailable
+        case targetUnreached(Int32, Int32)
+        case noSnapshotGuest
+
+        var errorDescription: String? {
+            switch self {
+            case .pointerUnavailable: "The guest pointer is unavailable."
+            case .targetUnreached(let x, let y): "The guest pointer did not reach (\(x), \(y))."
+            case .noSnapshotGuest: "Start a guest with mac before taking a snapshot."
+            }
+        }
     }
 
     static func parse(_ text: String) throws -> [Command] {
@@ -45,6 +62,17 @@ enum Autopilot {
                 let key = argument == "space" ? " " : argument
                 guard key.count == 1, let character = key.first else { throw invalid }
                 commands.append(.chord(character))
+            case "pointer" where argument.isEmpty: commands.append(.pointer)
+            case "move", "click":
+                let xy = argument.split(whereSeparator: \.isWhitespace)
+                guard xy.count == 2, let x = UInt16(xy[0]), let y = UInt16(xy[1]) else { throw invalid }
+                commands.append(.move(x: Int32(x), y: Int32(y), click: verb == "click"))
+            case "snap":
+                let name = argument.isEmpty ? "snap" : argument
+                guard name.utf8.count <= 64, name.allSatisfy({
+                    $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-")
+                }) else { throw invalid }
+                commands.append(.snap(name))
             case "log" where argument.isEmpty: commands.append(.mark)
             case "stop" where argument.isEmpty: commands.append(.stop)
             case "exit" where argument.isEmpty: commands.append(.exit)
@@ -52,6 +80,24 @@ enum Autopilot {
             }
         }
         return commands
+    }
+
+    @MainActor static func aim(x: Int32, y: Int32, click: Bool) async throws {
+        for _ in 0..<1500 {
+            try Task.checkCancellation()
+            let step = henge_vm_pointer_step(x, y)
+            if step < 0 { throw ExecutionError.pointerUnavailable }
+            if step > 0 {
+                if click {
+                    henge_vm_mouse_button(0, 1)
+                    defer { henge_vm_mouse_button(0, 0) }
+                    try await Task.sleep(for: .milliseconds(120))
+                }
+                return
+            }
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        throw ExecutionError.targetUnreached(x, y)
     }
 
     @MainActor static func run(start: (VirtualMac) -> Void) async {
@@ -70,6 +116,7 @@ enum Autopilot {
                 }
                 return try parse(text)
             }.value
+            var selectedMac: VirtualMac?
             for command in commands {
                 try Task.checkCancellation()
                 switch command {
@@ -83,11 +130,23 @@ enum Autopilot {
                         HengeLog.log("autopilot", "Guest or JIT unavailable. Stopping plan.")
                         return
                     }
+                    selectedMac = mac
                     start(mac)
                 case .wait(let duration): try await Task.sleep(for: duration)
                 case .type(let value): await Keys.typeSlowly(value)
                 case .key(let key): Keys.press(key)
                 case .chord(let key): Keys.chord(125, key)
+                case .pointer:
+                    var x: Int32 = 0, y: Int32 = 0
+                    guard henge_vm_pointer(&x, &y) == 0 else { throw ExecutionError.pointerUnavailable }
+                    HengeLog.log("autopilot", "Pointer at (\(x), \(y))")
+                case .move(let x, let y, let click):
+                    try await aim(x: x, y: y, click: click)
+                    HengeLog.log("autopilot", "\(click ? "Clicked" : "Moved") at (\(x), \(y))")
+                case .snap(let name):
+                    guard let mac = selectedMac else { throw ExecutionError.noSnapshotGuest }
+                    let url = try await MacPreview.saveAutomationSnapshot(named: name, for: mac)
+                    HengeLog.log("autopilot", "Saved \(url.lastPathComponent)")
                 case .mark: HengeLog.log("autopilot", "Marker at \(Date().timeIntervalSince1970)")
                 case .stop: henge_vm_stop()
                 case .exit: exit(0)

@@ -228,26 +228,21 @@ static void prof_dump(const char *path) {
 
 /* Walks the pointer to a spot on the screen, watching where the display says
    it is, in small steps as a hand makes: macOS accelerates big ones past the target. */
-static void pointer_to(int x, int y) {
-    const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
-    for (int i = 0; page && i < 1500; i++) {
-        uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
-        int dx = x - (int)(at & 0xffff), dy = y - (int)(at >> 16);
-        if (abs(dx) < 3 && abs(dy) < 3) break;
-        int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
-        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
-        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, sy);
-        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+static bool pointer_to(int x, int y) {
+    for (int i = 0; i < 1500; i++) {
+        int step = hv_vm_pointer_step(x, y);
+        if (step > 0) return true;
+        if (step < 0) break;
         usleep(30000);
     }
+    fprintf(stderr, "hengevm: pointer did not reach (%d,%d)\n", x, y);
+    return false;
 }
 
 static void click_here(void) {
-    hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 1);
-    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+    hv_vm_mouse_button(0, 1);
     usleep(120000);
-    hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
-    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+    hv_vm_mouse_button(0, 0);
 }
 
 static void key_event(int code, int down) {
@@ -298,9 +293,10 @@ static void *click_thread(void *unused) {
         p += n;
         if (*p == ';') p++;
         while (time(NULL) - start < when) sleep(1);
-        pointer_to(x, y);
-        fprintf(stderr, "hengevm: click (%d,%d) at %ld s\n", x, y, (long)(time(NULL) - start));
-        click_here();
+        if (pointer_to(x, y)) {
+            fprintf(stderr, "hengevm: click (%d,%d) at %ld s\n", x, y, (long)(time(NULL) - start));
+            click_here();
+        }
     }
     return NULL;
 }
@@ -527,7 +523,9 @@ static void *input_thread(void *unused) {
         at = ftell(f);
         line[strcspn(line, "\n")] = 0;
         int x, y;
-        if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
+        if (sscanf(line, "click %d %d", &x, &y) == 2) {
+            if (pointer_to(x, y)) click_here();
+        }
         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
         else if (sscanf(line, "scroll %d %d", &x, &y) == 2) {
             if (y) hv_vm_mouse_wheel(y);

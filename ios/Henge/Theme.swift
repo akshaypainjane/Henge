@@ -114,16 +114,47 @@ enum MacPreview {
     /// Off the main thread.
     static func save(for mac: VirtualMac) {
         let url = file(for: mac), height = Int(640 / mac.aspect)
-        Task.detached(priority: .utility) { write(to: url, height: height) }
+        Task.detached(priority: .utility) { try? write(to: url, width: 640, height: height) }
     }
 
     /// Before the machine stops, while there is still a screen to read.
-    static func saveNow(for mac: VirtualMac) { write(to: file(for: mac), height: Int(640 / mac.aspect)) }
+    static func saveNow(for mac: VirtualMac) {
+        try? write(to: file(for: mac), width: 640, height: Int(640 / mac.aspect))
+    }
 
-    private static func write(to url: URL, height: Int) {
-        let image = saving.withLock { enabled in enabled ? capture(width: 640, height: height) : nil }
-        guard let image, let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else { return }
-        try? data.write(to: url, options: .atomic)
+    #if DEBUG
+    @MainActor static func saveAutomationSnapshot(named name: String, for mac: VirtualMac) async throws -> URL {
+        let screen = mac.screen
+        guard screen.width > 0, screen.height > 0 else { throw SaveError.unavailable }
+        let scale = min(1, 1920.0 / Double(max(screen.width, screen.height)))
+        let width = max(1, Int(Double(screen.width) * scale))
+        let height = max(1, Int(Double(screen.height) * scale))
+        let url = URL.cachesDirectory.appendingPathComponent("henge-snap-\(name).jpg")
+        try await Task.detached(priority: .utility) { try write(to: url, width: width, height: height) }.value
+        return url
+    }
+    #endif
+
+    private enum SaveError: LocalizedError {
+        case disabled, unavailable
+
+        var errorDescription: String? {
+            switch self {
+            case .disabled: "Screen saving is disabled for this camera session."
+            case .unavailable: "Could not capture the guest display."
+            }
+        }
+    }
+
+    private static func write(to url: URL, width: Int, height: Int) throws {
+        let image = try saving.withLock { enabled in
+            guard enabled else { throw SaveError.disabled }
+            return capture(width: width, height: height)
+        }
+        guard let image, let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else {
+            throw SaveError.unavailable
+        }
+        try data.write(to: url, options: .atomic)
     }
 }
 

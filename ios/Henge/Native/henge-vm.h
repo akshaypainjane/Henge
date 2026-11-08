@@ -62,6 +62,8 @@ void henge_vm_mouse_button(int button, int down);
 void henge_vm_mouse_scroll(int dx, int dy);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
+/* Debug build only. See hv_vm_pointer_step for return values. */
+int henge_vm_pointer_step(int x, int y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 

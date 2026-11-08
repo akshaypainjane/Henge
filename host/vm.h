@@ -77,6 +77,19 @@ void hv_vm_mouse_wheel(int dy);
 void hv_vm_mouse_hwheel(int dx);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
+/* Guide automation in small steps because macOS accelerates large deltas.
+   Returns 1 on confirmed arrival (within two pixels), 0 after a move, or -1
+   when the guest has no pointer. The caller waits between steps. */
+static inline int hv_vm_pointer_step(int x, int y) {
+    int px, py;
+    if (hv_vm_pointer(&px, &py) != 0) return -1;
+    int64_t dx = (int64_t)x - px, dy = (int64_t)y - py;
+    if (dx > -3 && dx < 3 && dy > -3 && dy < 3) return 1;
+    int sx = dx > 16 ? 16 : dx < -16 ? -16 : (int)dx;
+    int sy = dy > 16 ? 16 : dy < -16 ? -16 : (int)dy;
+    hv_vm_mouse_move(sx, sy);
+    return 0;
+}
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 int hv_vm_snapshot(uint8_t *bgra, int width, int height);
 

@@ -185,6 +185,9 @@ void henge_vm_mouse_scroll(int dx, int dy) {
     if (dx) hv_vm_mouse_hwheel(dx);
 }
 int henge_vm_pointer(int *x, int *y) { return state == 1 ? hv_vm_pointer(x, y) : -1; }
+#if DEBUG
+int henge_vm_pointer_step(int x, int y) { return state == 1 ? hv_vm_pointer_step(x, y) : -1; }
+#endif
 int henge_vm_snapshot(uint8_t *bgra, int width, int height) { return state == 1 ? hv_vm_snapshot(bgra, width, height) : -1; }
 
 void henge_vm_set_display_layer(void *layer) {
