@@ -231,11 +231,17 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     sigaction(SIGSEGV, &ill, &prior_segv);
     signal(SIGPIPE, SIG_IGN); /* a guest connection closing at the far end must not end the machine */
     if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
-    if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
+    if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0) {
+        hv_disk_close(&disk);
         return fail(err, errlen, "Cannot open the auxiliary storage.");
+    }
     size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)768 << 20;
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
-    if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
+    if (r != 0) {
+        hv_disk_close(&aux);
+        hv_disk_close(&disk);
+        return fail(err, errlen, "Cannot set up the JIT region.");
+    }
     m.log = c->log;
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
@@ -249,8 +255,12 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         cfg.run_installer1 = a, cfg.run_installer2 = b2;
     }
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
-    if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
-        return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
+    if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0) {
+        hv_machine_free(&m);
+        hv_disk_close(&aux);
+        hv_disk_close(&disk);
+        return fail(err, errlen, "The system could not allocate memory for the virtual Mac.");
+    }
     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
     hv_vmapple_reset_cpu(&board);
     if (board.net && !c->no_net) {

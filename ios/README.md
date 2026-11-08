@@ -10,8 +10,8 @@ libslirp and glib for iOS).
 - **JIT**: on iOS 26+ (TXM) only an attached debugger can grant executable
   memory. Henge uses the same machinery as Husk: StikDebug, TrollStore, a
   jailbreak, or the built-in StikJIT helper (`HengeJITHelper.appex`, with
-  on-device pairing on iOS 27). The app claims one 1 GB region per launch
-  (`JITBootstrap.jitBytes`) and the engine writes through a `vm_remap`'d alias
+  on-device pairing on iOS 27). The app claims one JIT region per launch, 512 MiB
+  with standard addressing or 1 GiB with extended addressing. The engine writes through a `vm_remap`'d alias
   (`host/jit_region.c`, split mode).
 - **Memory**: `increased-memory-limit` is recommended, not required. Once a
   debugger has attached, guest RAM is kept out of the app's memory limit, and if

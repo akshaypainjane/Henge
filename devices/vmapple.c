@@ -1,7 +1,11 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
 
+#include <TargetConditionals.h>
 #include <errno.h>
+#if TARGET_OS_IOS
+#include <os/proc.h>
+#endif
 #include <mach/mach.h>
 #include <mach/mach_error.h>
 #include <mach/vm_map.h>
@@ -172,7 +176,12 @@ extern kern_return_t mach_memory_entry_ownership(mach_port_t entry, task_t owner
 static uint8_t *alloc_no_footprint(uint64_t size) {
     enum { CHUNK = 128u << 20, MAP_MEM_LEDGER_TAGGED_ = 0x002000, MAP_MEM_NAMED_CREATE_ = 0x020000, LEDGER_TAG_DEFAULT = 1, LEDGER_NO_FOOTPRINT = 1 };
     vm_address_t base = 0;
-    if (vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return NULL;
+    kern_return_t reserve = vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE);
+    if (reserve != KERN_SUCCESS) {
+        fprintf(stderr, "hengevm: could not reserve %llu MiB for guest RAM: %s\n",
+                (unsigned long long)(size >> 20), mach_error_string(reserve));
+        return NULL;
+    }
     for (uint64_t off = 0; off < size; off += CHUNK) {
         uint64_t len = size - off < CHUNK ? size - off : CHUNK;
         memory_object_size_t got = len;
@@ -241,6 +250,57 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     return deadline;
 }
 
+/* Shared file pages can be written back under memory pressure. The file is
+   unlinked immediately and disappears when its last mapping closes. */
+static uint8_t *alloc_file_ram(const char *path, uint64_t size) {
+    uint8_t *ram = MAP_FAILED;
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        if (unlink(path) == 0 && ftruncate(fd, (off_t)size) == 0)
+            ram = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        int error = errno;
+        close(fd);
+        errno = error;
+    }
+    if (ram == MAP_FAILED)
+        fprintf(stderr, "hengevm: file-backed guest RAM (%llu MiB) failed: %s\n",
+                (unsigned long long)(size >> 20), strerror(errno));
+    return ram;
+}
+
+static uint8_t *alloc_guest_ram(uint64_t size, const char *path, int *file_backed) {
+    if (!getenv("HV_RAM_NO_LEDGER")) {
+        uint8_t *ram = alloc_no_footprint(size);
+        if (ram) return ram;
+    }
+    if (path && *path) {
+        uint8_t *ram = alloc_file_ram(path, size);
+        if (ram != MAP_FAILED) {
+            *file_backed = 1;
+            fprintf(stderr, "hengevm: guest RAM (%llu MiB) is backed by a file\n", (unsigned long long)(size >> 20));
+            return ram;
+        }
+    }
+#if TARGET_OS_IOS
+    /* Ordinary anonymous pages count toward the app's memory limit. Leave
+       room for the emulator, its translated code and the restore process. */
+    const uint64_t headroom = 512ull << 20;
+    uint64_t available = os_proc_available_memory();
+    if (available <= headroom || size > available - headroom) {
+        fprintf(stderr, "hengevm: skipping %llu MiB of anonymous guest RAM with %llu MiB available\n",
+                (unsigned long long)(size >> 20), (unsigned long long)(available >> 20));
+        return MAP_FAILED;
+    }
+#endif
+    uint8_t *ram = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (ram == MAP_FAILED)
+        fprintf(stderr, "hengevm: anonymous guest RAM (%llu MiB) failed: %s\n",
+                (unsigned long long)(size >> 20), strerror(errno));
+    else
+        fprintf(stderr, "hengevm: guest RAM (%llu MiB) is anonymous\n", (unsigned long long)(size >> 20));
+    return ram;
+}
+
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
@@ -248,41 +308,40 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->cpu = cpu;
     b->ncpus = cfg->nr_cpus ? (int)cfg->nr_cpus : 1;
     if (b->ncpus > HV_MAX_CPUS) b->ncpus = HV_MAX_CPUS;
-    b->ram_size = ram_size;
-    /* HV_RAM_FILE: guest RAM in a file. iOS's memory limit counts anonymous
-       pages and not pages of a mapped file, which it can also write out and
-       drop by itself, so the guest can have more RAM than the app may hold.
-       The file is unlinked at once and goes away with the process. */
     const char *ram_file = getenv("HV_RAM_FILE");
-    b->ram = MAP_FAILED;
-    if (!getenv("HV_RAM_NO_LEDGER")) {
-        uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
-        if (free_of_footprint) b->ram = free_of_footprint;
+    const uint64_t requested = ram_size;
+    int file_backed = 0;
+    b->ram = alloc_guest_ram(ram_size, ram_file, &file_backed);
+#if TARGET_OS_IOS
+    /* Probe the real writable mapping after the translator tables exist.
+       The earlier address-space estimate cannot guarantee this succeeds. */
+    const uint64_t minimum = 2048ull << 20, step = 512ull << 20;
+    while (b->ram == MAP_FAILED && ram_size > minimum) {
+        ram_size = ram_size - minimum < step ? minimum : ram_size - step;
+        b->ram = alloc_guest_ram(ram_size, ram_file, &file_backed);
     }
-    if (b->ram == MAP_FAILED && ram_file && *ram_file) {
-        int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
-        if (fd >= 0) {
-            unlink(ram_file);
-            if (ftruncate(fd, (off_t)ram_size) == 0)
-                b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            close(fd);
-        }
-        if (b->ram == MAP_FAILED) fprintf(stderr, "hengevm: guest RAM file %s failed: %s; using anonymous memory\n", ram_file, strerror(errno));
-        else {
-            fprintf(stderr, "hengevm: guest RAM (%llu MB) is backed by a file\n", (unsigned long long)(ram_size >> 20));
-            if (!getenv("HV_RAM_NO_PREFAULT")) {
-                struct PrefaultArgs *a = malloc(sizeof *a);
-                a->ram = b->ram, a->size = ram_size;
-                pthread_t t;
-                if (pthread_create(&t, NULL, prefault_thread, a) == 0) pthread_detach(t);
-                else free(a);
-            }
-        }
-    }
-    if (b->ram == MAP_FAILED) b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+#endif
     if (b->ram == MAP_FAILED) return -1;
+    b->ram_size = ram_size;
+    if (ram_size < requested)
+        fprintf(stderr, "hengevm: using %llu MiB of guest RAM (requested %llu MiB)\n",
+                (unsigned long long)(ram_size >> 20), (unsigned long long)(requested >> 20));
     b->rom = mmap(NULL, ROM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (b->rom == MAP_FAILED) return -1;
+    if (b->rom == MAP_FAILED) {
+        fprintf(stderr, "hengevm: boot ROM mapping failed: %s\n", strerror(errno));
+        munmap(b->ram, ram_size);
+        b->ram = NULL;
+        return -1;
+    }
+    if (file_backed && !getenv("HV_RAM_NO_PREFAULT")) {
+        struct PrefaultArgs *a = malloc(sizeof *a);
+        if (a) {
+            *a = (struct PrefaultArgs){.ram = b->ram, .size = ram_size};
+            pthread_t t;
+            if (pthread_create(&t, NULL, prefault_thread, a) == 0) pthread_detach(t);
+            else free(a);
+        }
+    }
     /* QEMU maps the firmware as RAM, and so do we. */
     hv_machine_add_ram(m, VMAPPLE_FIRMWARE, ROM_SIZE, b->rom, 0);
     hv_machine_add_ram(m, VMAPPLE_MEM, ram_size, b->ram, 0);

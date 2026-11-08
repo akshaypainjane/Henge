@@ -255,12 +255,28 @@ void hv_machine_free(HvMachine *m) {
     for (int i = 0; i < m->nram; i++) {
         free(m->ram[i].code_pages);
         free(m->ram[i].page_gen);
+        free(m->ram[i].whint);
     }
     free(m->blocks);
     for (int i = 0; i < HV_MAX_CPUS; i++) {
-        free(m->percpu[i].ijc);
-        free(m->percpu[i].ucode);
+        HvPerCpu *p = &m->percpu[i];
+        free(p->ijc);
+        free(p->ucode);
+        free(p->cid_chunks);
+        for (int k = 0; k < HV_STASHES; k++) {
+            free(p->stash[k].slot);
+            free(p->stash[k].ent);
+        }
+        pthread_mutex_destroy(&p->req_mu);
+        pthread_cond_destroy(&p->wake_cv);
+        pthread_mutex_destroy(&p->wake_mu);
     }
+    pthread_cond_destroy(&m->stw_cv);
+    pthread_mutex_destroy(&m->stw_mu);
+    pthread_mutex_destroy(&m->tr_mu);
+    pthread_mutex_destroy(&m->dev_mu);
+    pthread_cond_destroy(&m->big_cv);
+    pthread_mutex_destroy(&m->big_mu);
     free(m->slots);
     free(m->slot_site);
     free(m->slot_stub);
