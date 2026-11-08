@@ -230,8 +230,12 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     sigaction(SIGBUS, &ill, &prior_bus);
     sigaction(SIGSEGV, &ill, &prior_segv);
     signal(SIGPIPE, SIG_IGN); /* a guest connection closing at the far end must not end the machine */
-    if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
-    if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0) {
+    bool uncached_writes = c->installer && c->tuning && c->tuning->uncached_disk_writes;
+    if (hv_disk_open(&disk, c->disk, 0, 0, uncached_writes) != 0)
+        return fail(err, errlen, "Cannot open the disk image.");
+    if (uncached_writes)
+        fprintf(stderr, "hengevm: restore disk writes %s\n", disk.write_fd >= 0 ? "uncached" : "cached (cache bypass unavailable)");
+    if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0, false) != 0) {
         hv_disk_close(&disk);
         return fail(err, errlen, "Cannot open the auxiliary storage.");
     }

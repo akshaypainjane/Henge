@@ -6,24 +6,39 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
+int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly, bool uncached_writes) {
+    d->write_fd = -1;
     d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
     if (d->fd < 0) return -1;
     struct stat st;
     if (fstat(d->fd, &st) != 0 || (uint64_t)st.st_size < offset) {
-        close(d->fd);
+        hv_disk_close(d);
         return -1;
     }
     d->offset = offset;
     d->size = (uint64_t)st.st_size - offset;
     d->readonly = readonly;
     d->flush_mode = HV_DISK_FLUSH_LEGACY;
+    if (uncached_writes && !readonly) {
+        /* Keep reads cached. If a second descriptor cannot bypass the cache
+           or the path was replaced between opens, use the original one. */
+        int fd = open(path, O_WRONLY);
+        if (fd >= 0) {
+            struct stat writer;
+            if (fstat(fd, &writer) == 0 && writer.st_dev == st.st_dev && writer.st_ino == st.st_ino &&
+                fcntl(fd, F_NOCACHE, 1) == 0)
+                d->write_fd = fd;
+            else
+                close(fd);
+        }
+    }
     return 0;
 }
 
 void hv_disk_close(HvDisk *d) {
+    if (d->write_fd >= 0) close(d->write_fd);
     if (d->fd >= 0) close(d->fd);
-    d->fd = -1;
+    d->fd = d->write_fd = -1;
 }
 
 int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len) {
@@ -41,9 +56,10 @@ int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len) {
 
 int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
     if (d->readonly || off > d->size || len > d->size - off) return -1;
+    int fd = d->write_fd >= 0 ? d->write_fd : d->fd;
     const uint8_t *p = buf;
     while (len) {
-        ssize_t n = pwrite(d->fd, p, len, (off_t)(d->offset + off));
+        ssize_t n = pwrite(fd, p, len, (off_t)(d->offset + off));
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;

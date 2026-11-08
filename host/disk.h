@@ -1,6 +1,7 @@
 #ifndef HENGEVM_DISK_H
 #define HENGEVM_DISK_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef enum HvDiskFlushMode {
@@ -13,13 +14,14 @@ typedef enum HvDiskFlushMode {
    notes say the first 16 KB of auxiliary.bin is metadata the guest never sees). */
 typedef struct HvDisk {
     int fd;
+    int write_fd;   /* optional F_NOCACHE descriptor for bulk restore writes */
     uint64_t offset;
     uint64_t size;   /* bytes visible to the guest */
     int readonly;
     HvDiskFlushMode flush_mode;
 } HvDisk;
 
-int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly);
+int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly, bool uncached_writes);
 void hv_disk_close(HvDisk *d);
 /* Return 0, or -1 on an I/O error or an access past the end. */
 int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len);

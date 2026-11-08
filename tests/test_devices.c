@@ -648,16 +648,17 @@ int main(void) {
     if (!mkdtemp(work)) return 1;
     snprintf(root_path, sizeof root_path, "%s/test-root.img", work);
     snprintf(aux_path, sizeof aux_path, "%s/test-aux.img", work);
-    if (make_disk(root_path, 1 << 20, 1) || make_disk(aux_path, 256 << 10, 2)) {
-        printf("cannot create test disks in %s\n", work);
+    static HvDisk root, aux;
+    /* The auxiliary disk skips a 16 KB header, as with auxiliary.bin. */
+    if (make_disk(root_path, 1 << 20, 1) || make_disk(aux_path, 256 << 10, 2) ||
+        hv_disk_open(&root, root_path, 0, 0, true) != 0 ||
+        hv_disk_open(&aux, aux_path, 16384, 0, false) != 0) {
+        printf("cannot prepare test disks in %s\n", work);
         unlink(root_path);
         unlink(aux_path);
         rmdir(work);
         return 1;
     }
-    static HvDisk root, aux;
-    hv_disk_open(&root, root_path, 0, 0);
-    hv_disk_open(&aux, aux_path, 16384, 0); /* as with auxiliary.bin: skip the 16 KB header */
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = 0x1234, .mac_en0 = {2, 0, 0, 0x12, 0x34, 0x56}};
     static const uint8_t mac[6] = {2, 0, 0, 0x12, 0x34, 0x56};
     if (hv_vmapple_create(&board, &m, &cpu, RAM_SIZE, &root, &aux, &cfg, mac) != 0) return 1;

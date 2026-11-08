@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     static HvDisk disk, aux;
-    if (hv_disk_open(&disk, disk_path, 0, 0) != 0 || hv_disk_open(&aux, aux_path, 16384, 0) != 0) return 1;
+    if (hv_disk_open(&disk, disk_path, 0, 0, false) != 0 || hv_disk_open(&aux, aux_path, 16384, 0, false) != 0) return 1;
     if (hv_machine_init(&m, 1 << 20) != 0) return 1;
     m.log = log;
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};

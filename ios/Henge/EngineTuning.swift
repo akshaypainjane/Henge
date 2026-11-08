@@ -20,6 +20,7 @@ enum EngineTuning {
         #endif
         return HvVmTuning(refresh_hz: useHighRefresh ? 120 : 60, stats_interval: statsInterval,
                           fast_disk_flush: !forInstall && defaults.bool(forKey: fastFlushKey),
+                          uncached_disk_writes: forInstall,
                           idle_spin: !forInstall && defaults.bool(forKey: wfiSpinKey),
                           superblocks: !forInstall && defaults.bool(forKey: superblocksKey))
     }
