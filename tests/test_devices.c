@@ -5,6 +5,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pvg_lite.h"
 #include "sysreg.h"
 #include "vmapple.h"
 
@@ -12,7 +13,6 @@ DECLARE_PROGRAM(p_timer_irq);
 DECLARE_PROGRAM(p_uart);
 extern const char devices_programs_begin[], devices_programs_finish[];
 
-#define WORK "/Volumes/macOS Storage/husk-work/hengevm"
 #define RAM_SIZE (64ull << 20)
 
 static HvMachine m;
@@ -50,6 +50,55 @@ static uint8_t *ram(uint64_t pa) { return hv_phys_ptr(&m, pa, 1); }
 #define ICC_PMR ICC(3, 0, 4, 6, 0)
 #define ICC_IGRPEN1 ICC(3, 0, 12, 12, 7)
 #define ICC_SGI1R ICC(3, 0, 12, 11, 5)
+
+static void test_pvg_commands(void) {
+    const uint64_t display = VMAPPLE_MEM + 0x20000;
+    uint32_t setup[] = {1, 20, 0, 0, (uint32_t)(display >> 14)};
+    hv_pvg_lite_command(board.pvg, setup, sizeof setup);
+
+    uint32_t short_swap[] = {8, 28, 0, 0, 0, 42, 0};
+    memset(ram(display + 0xf80), 0xff, 24);
+    hv_pvg_lite_command(board.pvg, short_swap, sizeof short_swap);
+    check("short GPU swap still presents", rd32(display + 0xfb0), 42);
+    for (unsigned i = 0; i < 6; i++)
+        check("short GPU swap zeroes missing gamma words", rd32(display + 0xf80 + 4 * i), 0);
+
+    uint32_t full_swap[] = {8, 52, 0, 0, 0, 43, 0, 1, 2, 3, 4, 5, 6};
+    hv_pvg_lite_command(board.pvg, full_swap, sizeof full_swap);
+    check("full GPU swap presents", rd32(display + 0xfb0), 43);
+    for (unsigned i = 0; i < 6; i++)
+        check("full GPU swap preserves gamma words", rd32(display + 0xf80 + 4 * i), i + 1);
+
+    short_swap[0] |= 0xffff0000u;
+    hv_pvg_lite_command(board.pvg, short_swap, sizeof short_swap);
+    check("truncated GPU barrier list does not present", rd32(display + 0xfb0), 43);
+
+    const uint64_t root = VMAPPLE_MEM + 0x24000;
+    wr32(VMAPPLE_GFX + 0x1030, (uint32_t)(root >> 14));
+    wr32(VMAPPLE_GFX + 0x1010, 0x100);
+    wr32(VMAPPLE_GFX + 0x1004, 0x120);
+    wr32(root + 0x100, 0);
+    wr32(root + 0x104, 16);
+    wr32(root + 0x108, 0x1234);
+
+    wr32(VMAPPLE_GFX + 0x1008, 1);
+    check("invalid GPU root pointer does not complete a command", rd32(root), 0);
+    wr32(VMAPPLE_GFX + 0x1008, 16);
+    check("valid GPU root command completes", rd32(root), 0x1234);
+
+    wr32(root + 0x110, 0);
+    wr32(root + 0x114, 20);
+    wr32(root + 0x118, 0x5678);
+    wr32(VMAPPLE_GFX + 0x1008, 32);
+    check("GPU root command cannot consume beyond submitted bytes", rd32(root), 0x1234);
+
+    wr64(VMAPPLE_IOSFC + 0x1000, root);
+    wr64(VMAPPLE_IOSFC + 0x1008, 1);
+    wr64(VMAPPLE_IOSFC + 0x1018, UINT64_MAX);
+    check("GPU mapper rejects a producer more than one ring ahead", rd32(VMAPPLE_IOSFC + 0x1020), 0);
+    wr64(VMAPPLE_IOSFC + 0x1018, 1);
+    check("GPU mapper accepts a valid producer after a rejected doorbell", rd32(VMAPPLE_IOSFC + 0x1020), 1);
+}
 
 static void test_gic(void) {
     HvGic *g = board.gic;
@@ -442,9 +491,17 @@ static void test_guest_programs(void) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
-    const char *root_path = WORK "/test-root.img", *aux_path = WORK "/test-aux.img";
+    char work[] = "./henge-test-devices.XXXXXX";
+    char root_path[sizeof work + sizeof "/test-root.img"];
+    char aux_path[sizeof work + sizeof "/test-aux.img"];
+    if (!mkdtemp(work)) return 1;
+    snprintf(root_path, sizeof root_path, "%s/test-root.img", work);
+    snprintf(aux_path, sizeof aux_path, "%s/test-aux.img", work);
     if (make_disk(root_path, 1 << 20, 1) || make_disk(aux_path, 256 << 10, 2)) {
-        printf("cannot create test disks in %s\n", WORK);
+        printf("cannot create test disks in %s\n", work);
+        unlink(root_path);
+        unlink(aux_path);
+        rmdir(work);
         return 1;
     }
     static HvDisk root, aux;
@@ -478,11 +535,13 @@ int main(void) {
     wr32(VMAPPLE_GPIO + 0x41c, 1u << 3);
     check("gpio interrupt cleared", board.gic->level[32 + VMAPPLE_IRQ_GPIO], 0);
     test_guest_programs();
+    test_pvg_commands();
 
     hv_disk_close(&root);
     hv_disk_close(&aux);
     unlink(root_path);
     unlink(aux_path);
+    rmdir(work);
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

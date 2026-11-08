@@ -83,12 +83,12 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     uint32_t first;
     uint32_t surface_w, surface_h, fourcc; /* its own, whatever views the guest makes of it */
     id<MTLTexture> scanout; /* the same pixels, as the display reads them */
-    /* Multi-plane surfaces cannot sit on a buffer: a real IOSurface, kept up to date from the guest's pages. */
+    /* Multi-plane surfaces use a real IOSurface separate from the guest's pages. */
     IOSurfaceRef iosurface;
     uint64_t alloc, content_hash;
     /* When the host cannot lay it out as the guest did: where each plane is on both sides. */
     uint32_t relaid;
-    uint64_t plane_from[4], plane_to[4], plane_bytes[4], plane_row[4], plane_h[4];
+    uint64_t plane_from[4], plane_to[4], plane_bytes[4];
     /* A heap: private memory, a buffer over all of it. */
     id<MTLBuffer> heap_whole;
     /* A heap's or a private texture's copy in guest memory, and which side has the newest bytes. */
@@ -98,6 +98,28 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     HvObject *parent;
 }
 @end
+
+static BOOL byte_range(uint64_t offset, uint64_t bytes, uint64_t length) {
+    return offset <= length && bytes <= length - offset;
+}
+
+static BOOL mapped_range(HvObject *o, uint64_t offset, uint64_t bytes) {
+    return o && o->mapped && byte_range(offset, bytes, o->length);
+}
+
+static BOOL pixel_rows_fit(uint32_t width, uint32_t height, uint64_t row,
+                           uint64_t first, uint64_t length, BOOL half) {
+    if (!width || !height || width > 8192 || height > 8192) return NO;
+    uint64_t stride = (uint64_t)width * (half ? 8 : 4), end;
+    return row >= stride && (!half || !((first | row) & 1)) &&
+           !__builtin_mul_overflow((uint64_t)height - 1, row, &end) &&
+           !__builtin_add_overflow(end, stride, &end) && byte_range(first, end, length);
+}
+
+static uint64_t page_aligned_length(uint64_t first, uint64_t bytes) {
+    if (!bytes || first >= 0x4000 || bytes > UINT64_MAX - first - 0x3fff) return 0;
+    return (bytes + first + 0x3fff) & ~0x3fffull;
+}
 
 @implementation HvObject
 - (void)dealloc {
@@ -120,7 +142,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
-    uint64_t execs, draws, failed, heap_bytes, synced, remaps;
+    uint64_t execs, draws, failed, heap_bytes, synced, remaps, next_object_id;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
@@ -195,10 +217,16 @@ static double now_seconds(void) {
    the guest's pages change there is a new mapping and a new buffer. (A GPU still
    writing to pages the guest has freed and used again would corrupt its memory.) */
 static BOOL map_pages(HvReplay *r, uint32_t task, HvObject *o) {
-    uint64_t n = (o->length + 0x3fff) >> 14;
+    uint64_t length = page_aligned_length(0, o->length);
+    if (!length || length > r->device.maxBufferLength) return NO;
+    uint64_t n = length >> 14;
     vm_address_t base = 0;
-    if (vm_allocate(mach_task_self(), &base, n << 14, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return NO;
-    uint32_t *pages = calloc(n, 4);
+    if (vm_allocate(mach_task_self(), &base, length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return NO;
+    uint32_t *pages = calloc(n, sizeof *pages);
+    if (!pages) {
+        vm_deallocate(mach_task_self(), base, length);
+        return NO;
+    }
     hv_pvg_lite_task_pages(r->lite, task, o->vpage, n, pages);
     for (uint64_t i = 0; i < n; i++) {
         uint8_t *src = pages[i] ? hv_pvg_lite_page(r->lite, pages[i]) : NULL;
@@ -238,6 +266,7 @@ static void refresh_pages(HvReplay *r, uint32_t task, HvObject *o) {
     uint64_t n = (o->length + 0x3fff) >> 14;
     uint32_t stack[256];
     uint32_t *now = n <= 256 ? stack : malloc(n * 4);
+    if (!now) return;
     hv_pvg_lite_task_pages(r->lite, task, o->vpage, n, now);
     BOOL same = memcmp(now, o->pages, n * 4) == 0;
     if (now != stack) free(now);
@@ -361,10 +390,14 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 }
 
 - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
+    if (size < sizeof(uint32_t)) return nil;
     NSMutableData *all = [NSMutableData dataWithLength:size];
     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return nil;
     const uint32_t *w = all.bytes;
     uint32_t tag = w[0];
+    if (tag == 0xe || tag == 0x33 || tag == 0xb) {
+        if (size < 16 || w[3] > size - 16) return nil;
+    }
     if (tag == 0xe || tag == 0x33) { /* render or tile pipeline: {tag, size, ref, length, data} */
         id<HvMetalSPI> spi = (id)device;
         HvContext *ctx = [HvContext new];
@@ -402,6 +435,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         return state;
     }
     if (tag == 3) { /* sampler: {tag, size, ref, bits, lod min, lod max, ...} */
+        if (size < 28) return nil;
         uint64_t bits;
         memcpy(&bits, w + 3, 8);
         MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
@@ -427,12 +461,14 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     }
     if (tag == 0xd) return [device newFence];
     if (tag == 4) { /* depth and stencil: {tag, size, ref, flags, front {ops, read, write}, back {...}} */
+        if (size < 16) return nil;
         MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
         uint32_t f = w[3];
         d.depthCompareFunction = (MTLCompareFunction)(f & 7);
         d.depthWriteEnabled = (f >> 3) & 1;
         for (int side = 0; side < 2; side++) {
             if (!((f >> (4 + side)) & 1)) continue;
+            if (size < 16 + 12u * (side + 1)) return nil;
             const uint32_t *t = w + 4 + side * 3;
             MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
             sd.stencilCompareFunction = (MTLCompareFunction)(t[0] & 7);
@@ -454,6 +490,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 - (void)makeHeap:(HvObject *)o at:(uint64_t)at task:(uint32_t)task {
     struct __attribute__((packed)) { uint32_t vpage; uint64_t length; uint8_t flags; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return;
+    uint64_t length = page_aligned_length(0, h.length);
+    if (!length) return;
     MTLHeapDescriptor *d = [MTLHeapDescriptor new];
     d.size = (NSUInteger)h.length;
     d.type = MTLHeapTypePlacement;
@@ -468,7 +506,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (!heap) { [self complain:[NSString stringWithFormat:@"heap of %llu bytes failed", h.length]]; return; }
     o->object = heap;
     o->heap_whole = [heap newBufferWithLength:(NSUInteger)h.length options:MTLResourceStorageModePrivate offset:0];
-    o->length = (h.length + 0x3fff) & ~0x3fffull;
+    o->length = length;
     o->vpage = h.vpage;
     o->guest_backed = YES;
     heap_bytes += h.length;
@@ -492,7 +530,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 - (void)makeBuffer:(HvObject *)o at:(uint64_t)at task:(uint32_t)task {
     struct __attribute__((packed)) { uint64_t length; uint32_t vpage; uint32_t flags; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return;
-    o->length = (h.length + 0x3fff) & ~0x3fffull;
+    o->length = page_aligned_length(0, h.length);
+    if (!o->length) return;
     o->vpage = h.vpage;
     if (!map_pages(self, task, o)) return;
     o->plain_buffer = YES;
@@ -501,11 +540,13 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 }
 
 - (void)makeTexture:(HvObject *)o at:(uint64_t)at size:(uint32_t)size task:(uint32_t)task {
+    if (size < 12 + 0x18 + 12) return;
     NSMutableData *all = [NSMutableData dataWithLength:size];
     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return;
     const uint8_t *d = all.bytes;
     /* {length, page}, a layout table, {tag, size, ref}, the description. */
     memcpy(&o->length, d, 8);
+    if (o->length && !page_aligned_length(0, o->length)) return;
     memcpy(&o->vpage, d + 8, 4);
     const uint8_t *layout = d + 12;
     o->tex_mips = *(const uint16_t *)layout & 0x3fff;
@@ -514,12 +555,18 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     memcpy(&o->tex_stride, layout + 12, 8);
     o->tex_block_h = layout[0x15];
     uint32_t table = o->tex_mips * 36;
-    if (12 + 0x18 + table + 12 > size) { [self complain:@"texture entry too small"]; return; }
-    o->tex_layout = malloc(table);
-    memcpy(o->tex_layout, layout + 0x18, table);
-    const uint8_t *rec = layout + 0x18 + table;
+    uint32_t record = 12 + 0x18 + table;
+    if (record + 12 > size) { [self complain:@"texture entry too small"]; return; }
+    const uint8_t *rec = d + record;
     uint32_t tag = *(const uint32_t *)rec;
-    MTLTextureDescriptor *t = (tag == 0x34 || tag == 0x39) ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
+    BOOL v2 = tag == 0x34 || tag == 0x39;
+    if (size - record - 12 < (v2 ? 0x27 : 0x18)) return;
+    if (table) {
+        o->tex_layout = malloc(table);
+        if (!o->tex_layout) return;
+        memcpy(o->tex_layout, layout + 0x18, table);
+    }
+    MTLTextureDescriptor *t = v2 ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
     t.storageMode = MTLStorageModePrivate;
     t.usage |= MTLTextureUsageShaderRead;
     o->object = [device newTextureWithDescriptor:t];
@@ -599,23 +646,38 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
    width +0x20, height +0x28, row +0x30, bytes per element +0x38. */
 static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t alloc) {
     uint32_t fourcc, planes = desc[0x3e];
+    if (planes < 2 || planes > 4) return NULL;
     uint64_t width, height;
     memcpy(&fourcc, desc + 4, 4), memcpy(&width, desc + 0x20, 8), memcpy(&height, desc + 0x28, 8);
     NSMutableArray *info = [NSMutableArray new], *plain = [NSMutableArray new];
+    BOOL padded_sizes_fit = YES;
     uint64_t at = 0;
-    for (uint32_t i = 0; i < planes && i < 4; i++) {
+    for (uint32_t i = 0; i < planes; i++) {
         const uint8_t *pl = desc + 0x80 + i * 0x80;
         uint64_t off, size, w, h, row;
         uint16_t bpe;
         memcpy(&off, pl + 8, 8), memcpy(&size, pl + 0x18, 8), memcpy(&w, pl + 0x20, 8), memcpy(&h, pl + 0x28, 8), memcpy(&row, pl + 0x30, 8), memcpy(&bpe, pl + 0x38, 2);
+        uint64_t bytes;
+        if (__builtin_mul_overflow(row, h, &bytes) ||
+            !byte_range(off, bytes, alloc) || !byte_range(at, bytes, alloc)) return NULL;
+        padded_sizes_fit &= byte_range(off, size, alloc);
         [info addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(w), (__bridge id)kIOSurfacePlaneHeight: @(h), (__bridge id)kIOSurfacePlaneBytesPerRow: @(row),
                           (__bridge id)kIOSurfacePlaneOffset: @(off), (__bridge id)kIOSurfacePlaneSize: @(size), (__bridge id)kIOSurfacePlaneBytesPerElement: @(bpe),
                           (__bridge id)kIOSurfacePlaneElementWidth: @1, (__bridge id)kIOSurfacePlaneElementHeight: @1}];
         [plain addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(w), (__bridge id)kIOSurfacePlaneHeight: @(h), (__bridge id)kIOSurfacePlaneBytesPerRow: @(row),
-                           (__bridge id)kIOSurfacePlaneOffset: @(at), (__bridge id)kIOSurfacePlaneSize: @(row * h), (__bridge id)kIOSurfacePlaneBytesPerElement: @(bpe),
+                           (__bridge id)kIOSurfacePlaneOffset: @(at), (__bridge id)kIOSurfacePlaneSize: @(bytes), (__bridge id)kIOSurfacePlaneBytesPerElement: @(bpe),
                            (__bridge id)kIOSurfacePlaneElementWidth: @1, (__bridge id)kIOSurfacePlaneElementHeight: @1}];
-        to->plane_from[i] = off, to->plane_to[i] = at, to->plane_row[i] = row, to->plane_h[i] = h, to->plane_bytes[i] = row * h;
-        at += row * h;
+        to->plane_from[i] = off, to->plane_to[i] = at, to->plane_bytes[i] = bytes;
+        at += bytes;
+    }
+    /* Some video surfaces report sizes that include padding before the pixel offsets.
+       Keep the guest's offsets and strides, but describe only the rows at those offsets. */
+    if (!padded_sizes_fit) {
+        for (uint32_t i = 0; i < planes; i++) {
+            NSMutableDictionary *plane = [info[i] mutableCopy];
+            plane[(__bridge id)kIOSurfacePlaneSize] = @(to->plane_bytes[i]);
+            info[i] = plane;
+        }
     }
     NSDictionary *props = @{(__bridge id)kIOSurfaceWidth: @(width), (__bridge id)kIOSurfaceHeight: @(height), (__bridge id)kIOSurfacePixelFormat: @(fourcc),
                             (__bridge id)kIOSurfaceAllocSize: @(alloc), (__bridge id)kIOSurfacePlaneInfo: info};
@@ -628,28 +690,45 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
     return made;
 }
 
-/* Guest pixels into its IOSurface, when they changed. A sample of every 64th byte says so cheaply. */
-static void sync_iosurface(HvObject *s) {
-    if (!s->iosurface) return;
-    const uint8_t *from = s->mapped + s->first;
+static BOOL scanout_fits(HvObject *s, BOOL half) {
+    return mapped_range(s, s->first, s->alloc) &&
+           pixel_rows_fit(s->surface_w, s->surface_h, s->row, s->first, s->first + s->alloc, half);
+}
+
+/* A sample of every 64th byte detects CPU updates cheaply. */
+static uint64_t surface_hash(const uint8_t *pixels, uint64_t bytes) {
     uint64_t hash = 0xcbf29ce484222325ull;
-    for (uint64_t i = 0; i + 8 <= s->alloc; i += 64) {
+    for (uint64_t i = 0; bytes >= 8 && i <= bytes - 8; i += 64) {
         uint64_t v;
-        memcpy(&v, from + i, 8);
+        memcpy(&v, pixels + i, 8);
         hash = (hash ^ v) * 0x100000001b3ull;
     }
+    return hash;
+}
+
+/* Guest pixels into its IOSurface, when they changed. */
+static void sync_iosurface(HvObject *s) {
+    if (!s || !s->iosurface || !mapped_range(s, s->first, s->alloc)) return;
+    const uint8_t *from = s->mapped + s->first;
+    uint64_t hash = surface_hash(from, s->alloc);
     if (hash == s->content_hash) return;
-    s->content_hash = hash;
-    IOSurfaceLock(s->iosurface, 0, NULL);
+    if (IOSurfaceLock(s->iosurface, 0, NULL) != KERN_SUCCESS) return;
     uint8_t *base = IOSurfaceGetBaseAddress(s->iosurface);
+    size_t bytes = IOSurfaceGetAllocSize(s->iosurface);
+    if (!base) {
+        IOSurfaceUnlock(s->iosurface, 0, NULL);
+        return;
+    }
     if (s->relaid) {
         for (uint32_t i = 0; i < s->relaid && i < 4; i++)
-            if (s->plane_from[i] + s->plane_bytes[i] <= s->alloc && s->plane_to[i] + s->plane_bytes[i] <= IOSurfaceGetAllocSize(s->iosurface))
+            if (byte_range(s->plane_from[i], s->plane_bytes[i], s->alloc) &&
+                byte_range(s->plane_to[i], s->plane_bytes[i], bytes))
                 memcpy(base + s->plane_to[i], from + s->plane_from[i], s->plane_bytes[i]);
     } else {
-        memcpy(base, from, MIN(s->alloc, IOSurfaceGetAllocSize(s->iosurface)));
+        memcpy(base, from, MIN(s->alloc, bytes));
     }
     IOSurfaceUnlock(s->iosurface, 0, NULL);
+    s->content_hash = hash;
     const char *dump = getenv("HV_PVG_SURFACE_DUMP");
     static int dumped;
     if (dump && s->relaid && dumped < 6) {
@@ -685,26 +764,30 @@ static void sync_iosurface(HvObject *s) {
         uint32_t list, first;
         uint64_t alloc, row;
         memcpy(&list, desc, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
+        uint64_t length = page_aligned_length(first, alloc);
+        if (!length || length > device.maxBufferLength) return;
         surface = [HvObject new];
-        surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
+        surface->length = length;
         surface->row = row;
         surface->first = first;
+        surface->alloc = alloc;
         uint64_t sw, sh;
         memcpy(&sw, desc + 0x20, 8), memcpy(&sh, desc + 0x28, 8), memcpy(&surface->fourcc, desc + 4, 4);
-        surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
+        if (sw <= UINT32_MAX && sh <= UINT32_MAX)
+            surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
         uint64_t n = surface->length >> 14;
-        vm_address_t base = 0;
+        vm_address_t surface_base = 0;
         const uint32_t *pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
-        if (!pages || vm_allocate(mach_task_self(), &base, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        if (!pages || vm_allocate(mach_task_self(), &surface_base, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
             [self complain:[NSString stringWithFormat:@"surface %llu has no pages", h.mapping]];
             return;
         }
-        surface->mapped = (uint8_t *)base;
+        surface->mapped = (uint8_t *)surface_base;
         for (uint64_t i = 0; i < n; i++) {
             if (!(pages[i] & 1)) continue;
             uint8_t *src = hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000);
             if (!src) continue;
-            vm_address_t to = base + (i << 14);
+            vm_address_t to = surface_base + (i << 14);
             vm_prot_t cur, max;
             vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
         }
@@ -713,7 +796,6 @@ static void sync_iosurface(HvObject *s) {
         surface->mapping_in_buffer = surface->object != nil;
         surfaces[key] = surface;
         if (desc[0x3e] >= 2) {
-            surface->alloc = alloc;
             surface->iosurface = make_iosurface(surface, desc, alloc);
             if (!surface->iosurface) {
                 NSMutableString *m = [NSMutableString stringWithFormat:@"surface %llu: no IOSurface for its planes (alloc %llu):", h.mapping, alloc];
@@ -833,16 +915,25 @@ static BOOL has_guest_pages(HvObject *o) {
     if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return;
     NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
     if (!*blit) *blit = [cb blitCommandEncoder];
-    for (uint32_t s = 0; s < o->tex_slices * faces; s++)
-        for (uint32_t m = 0; m < o->tex_mips; m++) {
+    NSUInteger slices = MIN(o->tex_slices, tex.arrayLength) * faces;
+    NSUInteger mips = MIN(MIN(o->tex_mips, tex.mipmapLevelCount), 64);
+    for (uint32_t s = 0; s < slices; s++)
+        for (uint32_t m = 0; m < mips; m++) {
             const uint8_t *mip = o->tex_layout + m * 36;
             uint64_t off, row;
             uint32_t w, h, d;
             memcpy(&off, mip, 8), memcpy(&row, mip + 0x10, 8), memcpy(&w, mip + 0x18, 4), memcpy(&h, mip + 0x1c, 4), memcpy(&d, mip + 0x20, 4);
             uint32_t bh = o->tex_block_h ? o->tex_block_h : 1;
-            uint64_t from = o->tex_base + o->tex_stride * s + off;
-            uint64_t image = row * ((h + bh - 1) / bh);
-            if (from + image * d > o->length) continue;
+            uint64_t from, image, bytes;
+            if (!w || !h || !d || !row ||
+                w > MAX(1ull, tex.width >> m) || h > MAX(1ull, tex.height >> m) ||
+                d > MAX(1ull, tex.depth >> m) ||
+                __builtin_mul_overflow(o->tex_stride, (uint64_t)s, &from) ||
+                __builtin_add_overflow(from, o->tex_base, &from) ||
+                __builtin_add_overflow(from, off, &from) ||
+                __builtin_mul_overflow(row, ((uint64_t)h + bh - 1) / bh, &image) ||
+                __builtin_mul_overflow(image, (uint64_t)d, &bytes) ||
+                !byte_range(from, bytes, MIN(o->length, copy.length))) continue;
             if (down)
                 [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                               toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
@@ -895,11 +986,20 @@ typedef struct {
     uint32_t size;
 } Rec;
 
-#define U32(off) (*(const uint32_t *)(r.p + (off)))
-#define U16(off) (*(const uint16_t *)(r.p + (off)))
-#define U64(off) ({ uint64_t _v; memcpy(&_v, r.p + (off), 8); _v; })
+static void read_record(Rec r, uint32_t offset, void *out, size_t bytes) {
+    if (!byte_range(offset, bytes, r.size))
+        @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"truncated GPU record" userInfo:nil];
+    memcpy(out, r.p + offset, bytes);
+}
+
+/* Record starts are not necessarily aligned, even inside the private copy. */
+#define READ_RECORD(type, off) ({ type value; read_record(r, (off), &value, sizeof value); value; })
+#define U32(off) READ_RECORD(uint32_t, off)
+#define U16(off) READ_RECORD(uint16_t, off)
+#define U64(off) READ_RECORD(uint64_t, off)
 
 - (id<MTLRenderCommandEncoder>)beginPass:(Rec)r task:(uint32_t)task commandBuffer:(id<MTLCommandBuffer>)cb {
+    if (r.size < 0x48) return nil;
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
 #define ATTACH(a, o)                                                 \
     do {                                                             \
@@ -914,7 +1014,7 @@ typedef struct {
     } while (0)
     ATTACH(d.depthAttachment, 0);
     double clear_depth;
-    memcpy(&clear_depth, r.p + 0x1c, 8);
+    read_record(r, 0x1c, &clear_depth, 8);
     d.depthAttachment.clearDepth = clear_depth;
     ATTACH(d.stencilAttachment, 0x28);
     d.stencilAttachment.clearStencil = U32(0x44);
@@ -924,7 +1024,7 @@ typedef struct {
         MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
         ATTACH(c, o);
         double col[4];
-        memcpy(col, r.p + o + 0x1c, sizeof col);
+        read_record(r, o + 0x1c, col, sizeof col);
         c.clearColor = MTLClearColorMake(col[0], col[1], col[2], col[3]);
     }
     /* Memoryless and resolve store actions want the matching textures; a pass with none stays dontCare. */
@@ -950,7 +1050,7 @@ typedef struct {
     if (pre_threadgroup) d.threadgroupMemoryLength = pre_threadgroup;
     if (pre_tile_w) d.tileWidth = pre_tile_w, d.tileHeight = pre_tile_h;
     pre_raster_samples = pre_imageblock = pre_threadgroup = pre_tile_w = pre_tile_h = 0;
-    if (tracing) {
+    if (tracing && r.size >= 0x50) {
         id<MTLTexture> c0 = d.colorAttachments[0].texture;
         MTLClearColor cc = d.colorAttachments[0].clearColor;
         HvObject *co = [self object:U32(0x4c) task:task];
@@ -961,7 +1061,9 @@ typedef struct {
         NSMutableString *m = [NSMutableString stringWithString:@"no render encoder:"];
         for (int i = 0; i < 8; i++) {
             MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
-            uint32_t ref = U32(0x4c + (uint32_t)i * 0x3c);
+            uint32_t at = 0x4c + (uint32_t)i * 0x3c;
+            if (r.size < at + 4) break;
+            uint32_t ref = U32(at);
             if (ref) [m appendFormat:@" c%d ref %u %s %lux%lu fmt %lu load %lu store %lu usage %lu", i, ref, c.texture ? "ok" : "MISSING", (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.pixelFormat, (unsigned long)c.loadAction, (unsigned long)c.storeAction, (unsigned long)c.texture.usage];
         }
         [m appendFormat:@" depth ref %u stencil ref %u", U32(0), U32(0x28)];
@@ -1066,14 +1168,14 @@ typedef struct {
     }
     case 117: {
         MTLScissorRect s;
-        memcpy(&s, r.p, sizeof s);
+        read_record(r, 0, &s, sizeof s);
         [e setScissorRect:s];
         if (tracing) fprintf(stderr, "trace:  scissor %lu %lu %lu %lu\n", (unsigned long)s.x, (unsigned long)s.y, (unsigned long)s.width, (unsigned long)s.height);
         break;
     }
     case 130: {
         MTLViewport v;
-        memcpy(&v, r.p, sizeof v);
+        read_record(r, 0, &v, sizeof v);
         [e setViewport:v];
         break;
     }
@@ -1085,7 +1187,7 @@ typedef struct {
     }
     case 123: {
         float f;
-        memcpy(&f, r.p, 4);
+        read_record(r, 0, &f, 4);
         [e setTessellationFactorScale:f];
         break;
     }
@@ -1097,7 +1199,7 @@ typedef struct {
     case 107: [e setCullMode:(MTLCullMode)U32(0)]; break;
     case 108: {
         float f[3];
-        memcpy(f, r.p, sizeof f);
+        read_record(r, 0, f, sizeof f);
         [e setDepthBias:f[0] slopeScale:f[1] clamp:f[2]];
         break;
     }
@@ -1148,8 +1250,8 @@ typedef struct {
         for (uint32_t i = 0; i < count; i++) {
             strong[i] = [self get:U32(8 + i * 4) task:task];
             items[i] = strong[i];
-            memcpy(&lo[i], r.p + 8 + count * 4 + i * 4, 4);
-            memcpy(&hi[i], r.p + 8 + count * 8 + i * 4, 4);
+            read_record(r, 8 + count * 4 + i * 4, &lo[i], 4);
+            read_record(r, 8 + count * 8 + i * 4, &hi[i], 4);
         }
         if (tag == 113) [e setFragmentSamplerStates:items lodMinClamps:lo lodMaxClamps:hi withRange:NSMakeRange(index, count)];
         else [e setVertexSamplerStates:items lodMinClamps:lo lodMaxClamps:hi withRange:NSMakeRange(index, count)];
@@ -1190,7 +1292,7 @@ typedef struct {
     case 166: [e setVertexBufferOffset:(NSUInteger)U64(4) attributeStride:(NSUInteger)U64(12) atIndex:U32(0)]; break;
     case 101: {
         float c[4];
-        memcpy(c, r.p, sizeof c);
+        read_record(r, 0, c, sizeof c);
         [e setBlendColorRed:c[0] green:c[1] blue:c[2] alpha:c[3]];
         break;
     }
@@ -1329,24 +1431,25 @@ typedef struct {
     }
     case 155: {
         MTLSize s;
-        memcpy(&s, r.p, sizeof s);
+        read_record(r, 0, &s, sizeof s);
         [e dispatchThreadsPerTile:s];
         break;
     }
     case 162: { /* threads per tile, then a tile region */
         MTLSize s;
         MTLRegion region;
-        memcpy(&s, r.p, sizeof s);
-        memcpy(&region, r.p + sizeof s, sizeof region);
+        read_record(r, 0, &s, sizeof s);
+        read_record(r, sizeof s, &region, sizeof region);
         SEL sel = sel_registerName("dispatchThreadsPerTile:inRegion:");
         if ([(id)e respondsToSelector:sel]) ((void (*)(id, SEL, MTLSize, MTLRegion))objc_msgSend)(e, sel, s, region);
         else [e dispatchThreadsPerTile:s];
         break;
     }
     case 164: { /* where to write the tile size: {buffer ref, offset} */
+        if (r.size < 12) break;
         HvObject *o = [self object:U32(0) task:task];
         uint64_t off = U64(4);
-        if (o && o->mapped && off + 4 <= o->length) {
+        if (mapped_range(o, off, 4)) {
             uint16_t dims[2] = {(uint16_t)e.tileWidth, (uint16_t)e.tileHeight};
             memcpy(o->mapped + off, dims, 4);
         }
@@ -1365,7 +1468,7 @@ typedef struct {
     case 209: {
         MTLRegion region;
         if (r.size >= sizeof region) {
-            memcpy(&region, r.p, sizeof region);
+            read_record(r, 0, &region, sizeof region);
             [e setStageInRegion:region];
         }
         break;
@@ -1432,7 +1535,7 @@ typedef struct {
     case 211: [e setThreadgroupMemoryLength:(NSUInteger)U64(0) atIndex:U32(8)]; break;
     case 200: case 202: {
         MTLSize a, b;
-        memcpy(&a, r.p, sizeof a), memcpy(&b, r.p + sizeof a, sizeof b);
+        read_record(r, 0, &a, sizeof a), read_record(r, sizeof a, &b, sizeof b);
         if (tag == 200) [e dispatchThreadgroups:a threadsPerThreadgroup:b];
         else [e dispatchThreads:a threadsPerThreadgroup:b];
         break;
@@ -1447,6 +1550,57 @@ typedef struct {
         [self complain:[NSString stringWithFormat:@"compute command %u (%u bytes) skipped", tag, r.size]];
         break;
     }
+}
+
+static BOOL texture_region_fits(id<MTLTexture> tex, uint16_t slice, uint16_t level,
+                                MTLOrigin origin, MTLSize size) {
+    NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
+    return level < tex.mipmapLevelCount && level < 64 && slice / faces < tex.arrayLength &&
+           size.width && size.height && size.depth &&
+           byte_range(origin.x, size.width, MAX(1ull, tex.width >> level)) &&
+           byte_range(origin.y, size.height, MAX(1ull, tex.height >> level)) &&
+           byte_range(origin.z, size.depth, MAX(1ull, tex.depth >> level));
+}
+
+static uint64_t linear_pixel_bytes(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatA8Unorm:
+    case MTLPixelFormatR8Unorm ... MTLPixelFormatR8Sint: return 1;
+    case MTLPixelFormatR16Unorm ... MTLPixelFormatR16Float:
+    case MTLPixelFormatRG8Unorm ... MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm ... MTLPixelFormatBGR5A1Unorm: return 2;
+    case MTLPixelFormatR32Uint ... MTLPixelFormatR32Float:
+    case MTLPixelFormatRG16Unorm ... MTLPixelFormatRG16Float:
+    case MTLPixelFormatRGBA8Unorm ... MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatBGRA8Unorm ... MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm ... MTLPixelFormatBGR10A2Unorm:
+    case MTLPixelFormatBGR10_XR ... MTLPixelFormatBGR10_XR_sRGB: return 4;
+    case MTLPixelFormatRG32Uint ... MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Unorm ... MTLPixelFormatRGBA16Float:
+    case MTLPixelFormatBGRA10_XR ... MTLPixelFormatBGRA10_XR_sRGB: return 8;
+    case MTLPixelFormatRGBA32Uint ... MTLPixelFormatRGBA32Float: return 16;
+    default: return 0;
+    }
+}
+
+static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, uint64_t row,
+                             uint64_t image, MTLSize size) {
+    uint64_t bytes, last, pixel = linear_pixel_bytes(t.pixelFormat);
+    if (!size.depth || !size.height ||
+        __builtin_mul_overflow((uint64_t)size.depth - 1, image, &last)) return NO;
+    if (pixel) {
+        uint64_t line;
+        if (__builtin_mul_overflow((uint64_t)size.width, pixel, &line) ||
+            ((row || size.height > 1) && row < line) ||
+            __builtin_mul_overflow((uint64_t)size.height - 1, row, &bytes) ||
+            __builtin_add_overflow(bytes, line, &bytes)) return NO;
+    } else {
+        /* Metal validates format-specific alignment and compressed block layout.
+           At minimum the last image must begin within the buffer. */
+        bytes = 1;
+    }
+    return (size.depth == 1 || image >= bytes) &&
+           !__builtin_add_overflow(last, bytes, &last) && byte_range(off, last, b.length);
 }
 
 /* Blit calls. Tags start at 300. */
@@ -1468,14 +1622,19 @@ typedef struct {
         if (!b || !t) break;
         MTLSize size;
         MTLOrigin origin;
-        memcpy(&size, r.p + 0x20, sizeof size), memcpy(&origin, r.p + 0x38, sizeof origin);
-        [e copyFromBuffer:b sourceOffset:(NSUInteger)U64(8) sourceBytesPerRow:(NSUInteger)U64(0x10) sourceBytesPerImage:(NSUInteger)U64(0x18) sourceSize:size
-                toTexture:t destinationSlice:U16(0x50) destinationLevel:U16(0x52) destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
+        read_record(r, 0x20, &size, sizeof size), read_record(r, 0x38, &origin, sizeof origin);
+        uint64_t off = U64(8), row = U64(0x10), image = U64(0x18);
+        uint16_t slice = U16(0x50), level = U16(0x52);
+        if (!texture_region_fits(t, slice, level, origin, size) || !blit_buffer_fits(b, t, off, row, image, size)) break;
+        [e copyFromBuffer:b sourceOffset:off sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:size
+                toTexture:t destinationSlice:slice destinationLevel:level destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
         break;
     }
     case 301: { /* buffer to buffer */
         id<MTLBuffer> a = [self get:U32(0) task:task], b = [self get:U32(4) task:task];
-        if (a && b) [e copyFromBuffer:a sourceOffset:(NSUInteger)U64(8) toBuffer:b destinationOffset:(NSUInteger)U64(0x10) size:(NSUInteger)U64(0x18)];
+        uint64_t from = U64(8), to = U64(0x10), bytes = U64(0x18);
+        if (a && b && bytes && byte_range(from, bytes, a.length) && byte_range(to, bytes, b.length))
+            [e copyFromBuffer:a sourceOffset:from toBuffer:b destinationOffset:to size:bytes];
         break;
     }
     case 302: { /* texture to buffer */
@@ -1484,9 +1643,12 @@ typedef struct {
         if (!b || !t) break;
         MTLOrigin origin;
         MTLSize size;
-        memcpy(&origin, r.p + 8, sizeof origin), memcpy(&size, r.p + 0x20, sizeof size);
-        [e copyFromTexture:t sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:origin sourceSize:size toBuffer:b
-            destinationOffset:(NSUInteger)U64(0x38) destinationBytesPerRow:(NSUInteger)U64(0x40) destinationBytesPerImage:(NSUInteger)U64(0x48) options:(MTLBlitOption)U16(0x54)];
+        read_record(r, 8, &origin, sizeof origin), read_record(r, 0x20, &size, sizeof size);
+        uint64_t off = U64(0x38), row = U64(0x40), image = U64(0x48);
+        uint16_t slice = U16(0x50), level = U16(0x52);
+        if (!texture_region_fits(t, slice, level, origin, size) || !blit_buffer_fits(b, t, off, row, image, size)) break;
+        [e copyFromTexture:t sourceSlice:slice sourceLevel:level sourceOrigin:origin sourceSize:size toBuffer:b
+            destinationOffset:off destinationBytesPerRow:row destinationBytesPerImage:image options:(MTLBlitOption)U16(0x54)];
         break;
     }
     case 303: { /* texture to texture */
@@ -1494,14 +1656,18 @@ typedef struct {
         if (!a || !b) break;
         MTLOrigin from, to;
         MTLSize size;
-        memcpy(&from, r.p + 8, sizeof from), memcpy(&size, r.p + 0x20, sizeof size), memcpy(&to, r.p + 0x38, sizeof to);
-        [e copyFromTexture:a sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:from sourceSize:size
-                 toTexture:b destinationSlice:U16(0x54) destinationLevel:U16(0x56) destinationOrigin:to];
+        read_record(r, 8, &from, sizeof from), read_record(r, 0x20, &size, sizeof size), read_record(r, 0x38, &to, sizeof to);
+        uint16_t as = U16(0x50), al = U16(0x52), bs = U16(0x54), bl = U16(0x56);
+        if (!texture_region_fits(a, as, al, from, size) || !texture_region_fits(b, bs, bl, to, size)) break;
+        [e copyFromTexture:a sourceSlice:as sourceLevel:al sourceOrigin:from sourceSize:size
+                 toTexture:b destinationSlice:bs destinationLevel:bl destinationOrigin:to];
         break;
     }
     case 306: { /* fill: {ref, location, length, value} */
         id<MTLBuffer> b = [self get:U32(0) task:task];
-        if (b) [e fillBuffer:b range:NSMakeRange((NSUInteger)U64(4), (NSUInteger)U64(12)) value:r.p[20]];
+        uint64_t off = U64(4), bytes = U64(12);
+        if (b && bytes && byte_range(off, bytes, b.length))
+            [e fillBuffer:b range:NSMakeRange(off, bytes) value:READ_RECORD(uint8_t, 20)];
         break;
     }
     case 307: {
@@ -1521,6 +1687,7 @@ typedef struct {
    450, {ref, buffer ref, offset}. The guest's Metal puts these real host values
    into its argument buffers. */
 - (void)info:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    if (r.size < (tag == 460 ? 20u : 16u)) return;
     uint32_t ref = U32(0), bufref = U32(4);
     uint64_t off = U64(8);
     if (tag == 451 || tag == 469) { /* how big a texture would be in a heap: {description, buffer ref, offset} */
@@ -1528,9 +1695,9 @@ typedef struct {
         if (r.size < at + 12) return;
         MTLTextureDescriptor *t = tag == 451 ? descriptor_v1(r.p) : descriptor_v2(r.p);
         HvObject *to = [self object:U32(at) task:task];
-        refresh_pages(self, task, to);
+        if (to) refresh_pages(self, task, to);
         uint64_t where = U64(at + 4);
-        if (!to || !to->mapped || where + 16 > to->length) { [self complain:@"heap size query: no buffer"]; return; }
+        if (!mapped_range(to, where, 16)) { [self complain:@"heap size query: no buffer"]; return; }
         MTLSizeAndAlign sa = [device heapTextureSizeAndAlignWithDescriptor:t];
         uint64_t v[2] = {sa.size, sa.align};
         memcpy(to->mapped + where, v, 16);
@@ -1542,7 +1709,7 @@ typedef struct {
     }
     HvObject *to = [self object:bufref task:task];
     if (to) refresh_pages(self, task, to);
-    uint8_t *out = to && to->mapped && off + 28 <= to->length ? to->mapped + off : NULL;
+    uint8_t *out = mapped_range(to, off, 28) ? to->mapped + off : NULL;
     id obj = [self get:ref task:task];
     if (!out || !obj) {
         [self complain:[NSString stringWithFormat:@"info %u: ref %u buffer %u (%s, %llu bytes) offset %llu: %s", tag, ref, bufref,
@@ -1554,7 +1721,18 @@ typedef struct {
     switch (tag) {
     case 460: {
         SEL sel = sel_registerName("uniqueIdentifier");
-        uint64_t v = [obj respondsToSelector:sel] ? ((uint64_t (*)(id, SEL))objc_msgSend)(obj, sel) : (uint64_t)(uintptr_t)obj;
+        uint64_t v;
+        if ([obj respondsToSelector:sel]) {
+            v = ((uint64_t (*)(id, SEL))objc_msgSend)(obj, sel);
+        } else {
+            static char fallback_id_key;
+            NSNumber *identifier = objc_getAssociatedObject(obj, &fallback_id_key);
+            if (!identifier) {
+                identifier = @((1ull << 63) | ++next_object_id);
+                objc_setAssociatedObject(obj, &fallback_id_key, identifier, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            v = identifier.unsignedLongLongValue;
+        }
         memcpy(out, &v, 8);
         break;
     }
@@ -1685,19 +1863,19 @@ typedef struct {
         memcpy(&seglen, p, 4), memcpy(&info, p + 4, 4);
         p += 8;
         if ((info & 0xff) == 5) { /* protection options, then the real header */
+            if (end - p < 16) continue;
             p += 8;
-            if (p + 8 > end) continue;
             memcpy(&seglen, p, 4), memcpy(&info, p + 4, 4);
             p += 8;
         }
         uint32_t type = info & 0xff, cont = (info >> 8) & 0xff, more = (info >> 16) & 0xff;
-        if (p + seglen < end) end = p + seglen;
+        if ((size_t)(end - p) > seglen) end = p + seglen;
         if (!cont && e) { [e endEncoding]; e = nil; }
         if (type > 2) {
             const uint8_t *q = p;
-            while (q + 8 <= end) {
+            while (end - q >= 8) {
                 uint32_t tag = *(const uint32_t *)q, sz = *(const uint32_t *)(q + 4);
-                if (sz < 8 || q + sz > end) break;
+                if (sz < 8 || sz > end - q) break;
                 Rec r = {q + 8, sz - 8};
                 if (type == 4) [self info:tag rec:r task:task];
                 else [self complain:[NSString stringWithFormat:@"encoder type %u command %u (%u bytes) skipped", type, tag, sz]];
@@ -1709,10 +1887,10 @@ typedef struct {
         if (!e && type == 2) e = [cb blitCommandEncoder];
         etype = type;
         @try {
-            while (p + 8 <= end) {
+            while (end - p >= 8) {
                 uint32_t tag, size;
                 memcpy(&tag, p, 4), memcpy(&size, p + 4, 4);
-                if (size < 8 || p + size > end) break;
+                if (size < 8 || size > end - p) break;
                 Rec r = {p + 8, size - 8};
                 if (etype == 0 && tag >= 30 && tag <= 36) { /* these describe the pass that follows */
                     if (tag == 30 && size >= 12) pre_raster_samples = U32(0);
@@ -1792,17 +1970,18 @@ static const uint8_t *half_to_byte(void) {
     memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
     if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
     uint8_t *bits = malloc((size_t)stride * h);
+    if (!bits) return;
     if (hv_pvg_lite_task_read(lite, 0, off, bits, (uint32_t)stride * h)) {
         free(bits);
         [self complain:@"pointer image unreadable"];
         return;
     }
-    free(cursor);
     MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
     ct.storageMode = MTLStorageModeShared;
     id<MTLTexture> glyph = [device newTextureWithDescriptor:ct];
     [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
     os_unfair_lock_lock(&screen_lock);
+    free(cursor);
     cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
     cursor_tex = glyph;
     os_unfair_lock_unlock(&screen_lock);
@@ -1946,6 +2125,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
+    if (!scanout_fits(surface, half)) return;
     if (!surface->scanout) {
         MTLTextureDescriptor *t = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:half ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm
                                                                                      width:surface->surface_w height:surface->surface_h mipmapped:NO];
@@ -2137,21 +2317,28 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
     [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
-    NSUInteger bpp = surface->fourcc == 'RGhA' ? 8 : 4, row = surface->row;
+    BOOL half = surface->fourcc == 'RGhA';
+    if (!scanout_fits(surface, half)) return;
+    size_t row = surface->row;
     uint32_t w = surface->surface_w, h = surface->surface_h;
     if (!frame || !base || frame_w != w || frame_h != h) {
+        uint8_t *next_base = malloc((size_t)w * h * 4);
+        uint8_t *next_frame = calloc((size_t)w * h, 4);
+        if (!next_base || !next_frame) {
+            free(next_base);
+            free(next_frame);
+            return;
+        }
         free(base);
-        base = malloc((size_t)w * h * 4);
-        uint8_t *old = frame;
-        frame = calloc((size_t)w * h, 4); /* the old one may be on screen for a moment yet: a small leak beats a crash */
-        (void)old;
+        base = next_base;
+        frame = next_frame; /* the old one may be on screen for a moment yet */
         frame_w = w, frame_h = h;
         drawn_w = drawn_h = 0;
     }
     uint8_t *out = base;
     const uint8_t *src = surface->mapped + surface->first;
     const uint8_t *lut = half_to_byte();
-    if (bpp == 8) {
+    if (half) {
         for (uint32_t y = 0; y < h; y++) {
             const uint16_t *in = (const uint16_t *)(src + y * row);
             uint8_t *o = out + (size_t)y * w * 4;
@@ -2236,7 +2423,16 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
     HvReplay *r = (__bridge HvReplay *)m;
     dispatch_async(r->worker, ^{
         @autoreleasepool {
+            if (len < 12) {
+                free(cmd);
+                return;
+            }
             uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8; /* the barriers come first */
+            if (skip > len - 12) {
+                [r finishChannel:ch stamp:cmd[2]];
+                free(cmd);
+                return;
+            }
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
             BOOL gpu_completes = NO;
@@ -2336,16 +2532,18 @@ int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t w, uint32_t h) 
     uint32_t W = r->screen_w, H = r->screen_h;
     os_unfair_lock_unlock(&r->screen_lock);
     id<MTLBuffer> buffer = tex.buffer;
-    if (!buffer || !W || !H || buffer.storageMode == MTLStorageModePrivate) return -1;
-    const uint8_t *base = (const uint8_t *)buffer.contents + tex.bufferOffset;
-    size_t row = tex.bufferBytesPerRow;
+    if (!buffer || buffer.storageMode == MTLStorageModePrivate) return -1;
+    const uint8_t *contents = buffer.contents;
+    size_t row = tex.bufferBytesPerRow, offset = tex.bufferOffset;
+    if (!contents || !pixel_rows_fit(W, H, row, offset, buffer.length, half)) return -1;
+    const uint8_t *base = contents + offset;
     /* Four samples to a pixel: one makes text look broken at this size. */
     for (uint32_t y = 0; y < h; y++) {
         uint8_t *out = bgra + (size_t)y * w * 4;
         for (uint32_t x = 0; x < w; x++, out += 4) {
             uint32_t sum[3] = {0, 0, 0};
             for (uint32_t k = 0; k < 4; k++) {
-                size_t sx = (2 * x + (k & 1)) * (uint64_t)W / (2 * w), sy = (2 * y + (k >> 1)) * (uint64_t)H / (2 * h);
+                size_t sx = (2ull * x + (k & 1)) * W / (2ull * w), sy = (2ull * y + (k >> 1)) * H / (2ull * h);
                 const uint8_t *src = base + sy * row;
                 if (!half) {
                     for (int c = 0; c < 3; c++) sum[c] += src[sx * 4 + c];

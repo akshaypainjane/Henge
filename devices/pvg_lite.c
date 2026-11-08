@@ -95,15 +95,16 @@ static void do_root(HvPvgLite *p) {
     uint32_t off = reg(p, 0x1010), size = reg(p, 0x1004), wp = reg(p, 0x1008);
     if (!buf || size <= off) return;
     uint32_t ring = size - off;
-    while (p->root_rp != wp) {
+    uint32_t pending = wp - p->root_rp;
+    if ((off | ring | pending) & 3 || pending > ring || pending > (1u << 20)) return;
+    while (pending >= 12) {
         uint32_t at = p->root_rp % ring, hdr[3];
         for (int i = 0; i < 3; i++) {
             uint32_t *w = guest32(p, buf + off + (at + 4u * i) % ring);
             hdr[i] = w ? *w : 0;
         }
-        if (hdr[1] < 12 || hdr[1] > ring) {
+        if (hdr[1] < 12 || hdr[1] > pending || (hdr[1] & 3)) {
             fprintf(stderr, "hengevm: pvg-lite: bad root command %x length %x\n", hdr[0], hdr[1]);
-            p->root_rp = wp;
             break;
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: root op %x len %x stamp %x\n", hdr[0], hdr[1], hdr[2]);
@@ -121,9 +122,11 @@ static void do_root(HvPvgLite *p) {
             }
         }
         p->root_rp += hdr[1];
+        pending -= hdr[1];
         uint32_t *stamp = guest32(p, buf);
         if (stamp) __atomic_store_n(stamp, hdr[2], __ATOMIC_RELEASE);
     }
+    p->root_rp = wp;
 }
 
 /* Reads a command's bytes out of a ring made of scattered pages. */
@@ -184,11 +187,14 @@ static void display_ack(HvPvgLite *p, uint32_t seq) {
     *(uint32_t *)(d + 0xfc0) = 2;
 }
 
-static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
+static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args, uint32_t n) {
     uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
     if (!d) return;
-    memcpy(d + 0xf80, args + 4, 16); /* gamma table offset, length */
-    memcpy(d + 0xf90, args + 8, 8);  /* gamma entries, sum */
+    /* A swap can carry just the mapping. Missing gamma fields read as zero. */
+    uint8_t gamma[24] = {0};
+    uint32_t gamma_bytes = n - 16;
+    memcpy(gamma, args + 4, gamma_bytes < sizeof gamma ? gamma_bytes : sizeof gamma);
+    memcpy(d + 0xf80, gamma, sizeof gamma);
     p->swaps++;
     *(uint32_t *)(d + 0xf98) = (uint32_t)p->swaps;
     *(uint32_t *)(d + 0xfb0) = (uint32_t)mapping;
@@ -432,12 +438,12 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     uint32_t op = hdr[0] & 0xffff, args[32], skip = (hdr[0] >> 16) * 8; /* the barriers come first */
     uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
     if (n > sizeof args) n = sizeof args;
-    if (op == 0x38) {
+    if (op == 0x38 && n >= 16) {
         ring_read(p, table, size, rd + 12 + skip, args, 16);
         if (args[0] >> 1 < 512) p->task_root[args[0] >> 1] = args[3];
         return;
     }
-    if (op == 0x44) {
+    if (op == 0x44 && n >= 28) {
         ring_read(p, table, size, rd + 12 + skip, args, 28);
         if (args[0] < 512) {
             p->task_objects[args[0]] = (uint64_t)args[2] << 32 | args[1];
@@ -451,9 +457,10 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     if (op != 1 && op != 2 && op != 8) return;
     memset(args, 0, sizeof args);
     ring_read(p, table, size, rd + 12 + skip, args, n);
-    if (op == 1) display_set_page(p, (uint64_t)args[1] << 14);
-    else if (op == 2) display_ack(p, args[1]);
-    else display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
+    if (op == 1 && n >= 8) display_set_page(p, (uint64_t)args[1] << 14);
+    else if (op == 2 && n >= 8) display_ack(p, args[1]);
+    else if (op == 8 && n >= 16)
+        display_swap(p, (uint64_t)args[3] << 32 | args[2], args, n);
 }
 
 /* The mapper's table: a u32 per 16 KB of descriptors (16 of them), physical
@@ -470,12 +477,14 @@ uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
 }
 
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
+    if (len < 12) return;
     uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8;
-    uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
+    if (skip > len - 12) return;
+    uint32_t n = len - 12 - skip;
     const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
     if (op == 1 && n >= 8) display_set_page(p, (uint64_t)args[1] << 14);
     else if (op == 2 && n >= 8) display_ack(p, args[1]);
-    else if (op == 8 && n >= 16) display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
+    else if (op == 8 && n >= 16) display_swap(p, (uint64_t)args[3] << 32 | args[2], args, n);
 }
 
 static void do_channel(HvPvgLite *p, uint32_t ch) {
@@ -493,13 +502,18 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
     uint32_t size = pages << 14, wr = __atomic_load_n(&rec[0], __ATOMIC_ACQUIRE), rd = rec[1], last = 0;
     int any = 0;
     while (rd != wr) {
+        uint32_t pending = wr - rd;
+        if (pending < 12 || pending > size || ((rd | wr) & 3)) {
+            rd = wr & ~3u;
+            break;
+        }
         uint32_t hdr[3];
         for (int i = 0; i < 3; i++) {
             uint32_t at = (rd + 4u * i) % size;
             uint32_t *w = guest32(p, ((uint64_t)table[at >> 14] << 14) + (at & 0x3fff));
             hdr[i] = w ? *w : 0;
         }
-        if (hdr[1] < 12 || hdr[1] > size) {
+        if (hdr[1] < 12 || hdr[1] > pending || (hdr[1] & 3) || (hdr[0] >> 16) * 8 > hdr[1] - 12) {
             fprintf(stderr, "hengevm: pvg-lite: channel %u: bad command %x length %x at %x\n", ch, hdr[0], hdr[1], rd);
             rd = wr;
             break;
@@ -550,11 +564,18 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
             }
         }
         if (blocked) break;
+        uint32_t *copy = NULL;
+        if (p->metal) {
+            copy = malloc(hdr[1]);
+            if (!copy) {
+                p->chan_pending |= 1u << ch;
+                break;
+            }
+            ring_read(p, table, size, rd, copy, hdr[1]);
+        }
         channel_command(p, table, size, rd, hdr);
         p->submitted[ch] = hdr[2];
-        if (p->metal) {
-            uint32_t *copy = malloc(hdr[1]);
-            ring_read(p, table, size, rd, copy, hdr[1]);
+        if (copy) {
             hv_pvg_metal_submit(p->metal, p, ch, copy, hdr[1]);
         } else {
             last = hdr[2], any = 1;
@@ -572,9 +593,14 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
 
 /* The mapper's ring: surfaces coming and going. The guest waits for its interrupt. */
 static void do_mapper(HvPvgLite *p) {
+    uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8];
+    uint64_t read = p->io_regs[0x20 / 8], write = p->io_regs[0x18 / 8];
+    uint64_t pending = write - read;
+    if (pending > size || pending > (1u << 16) || size > (UINT64_MAX - ring) / 16) return;
+
     if (p->tally) {
-        uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+        uint64_t table = p->io_regs[0x10 / 8];
+        for (uint64_t i = read; i != write; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
@@ -590,13 +616,12 @@ static void do_mapper(HvPvgLite *p) {
         }
     }
     if (p->metal) {
-        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+        for (uint64_t i = read; i != write; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
         }
     }
-    p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
+    p->io_regs[0x20 / 8] = write;
     hv_gicv3_pend(p->gic, p->iosfc_irq);
 }
 
