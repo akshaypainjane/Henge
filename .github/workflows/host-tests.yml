@@ -1,0 +1,27 @@
+name: Host tests
+
+on:
+  push:
+    branches: [main, "fork/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run host engine and device tests
+        run: |
+          make -j3 test
+          HV_TLBT=0 ./build/test_mmu
+      - name: Validate debug automation plans
+        run: |
+          swiftc -D DEBUG ios/Henge/Autopilot.swift tests/test_autopilot.swift -o build/test_autopilot
+          ./build/test_autopilot
