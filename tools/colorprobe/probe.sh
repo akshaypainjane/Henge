@@ -7,13 +7,13 @@
 #   probe.sh watch           live, filtered stream of probe lines (idevicesyslog; Ctrl-C to stop)
 #   probe.sh console [secs]  launch attached to Xcode's console path (devicectl --console): lines appear as they happen,
 #                            and stopping this command stops Henge. Use `launch` + `watch` when the Mac must keep running.
-#   probe.sh trigger         ask the running probe for one capture (pushes Documents/colorprobe/trigger)
+#   probe.sh trigger         ask the running probe for one capture (pushes Library/Caches/colorprobe/trigger)
 #   probe.sh mode encoded|linear   switch how the half-float display is shown, live (encoded = pass-through, the fix;
 #                            linear = the old sRGB encode, for ACES-like linear profiles). Logged as event=color_mode.
 #   probe.sh follow [secs]   follow the probe lines by pulling Documents/henge.log every few seconds (default 5). Slower than watch but
 #                            does not depend on the syslog relay, which can stall; henge.log is the authoritative record.
 #   probe.sh capture         trigger, wait until the capture is done, pull the files, print the summary
-#   probe.sh pull            copy every file in Documents/colorprobe from the phone to $COLORPROBE_OUT
+#   probe.sh pull            copy every file in Library/Caches/colorprobe from the phone to $COLORPROBE_OUT
 #   probe.sh log             pull henge.log and keep only the colorprobe lines ($COLORPROBE_OUT/colorprobe.log)
 #   probe.sh summary [dir]   analyse the latest pull (tools/colorprobe/analyze.py)
 #   probe.sh status          is the phone reachable, is Henge running
@@ -23,7 +23,7 @@ DEV=${HENGE_DEVICE:-00008150-001A29A20A87801C}
 BID=${HENGE_BUNDLE:-com.hungbenjamin402.henge}
 OUT=${COLORPROBE_OUT:-$HOME/Library/Caches/henge-colorprobe}
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REMOTE=Documents/colorprobe
+REMOTE=Library/Caches/colorprobe
 mkdir -p "$OUT"
 
 dc() { xcrun devicectl device "$@"; }

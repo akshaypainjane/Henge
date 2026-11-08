@@ -36,7 +36,7 @@
      post_check    the captured post-shader frame against what the mode in force should have produced from the source: max difference, pixels
                    over 1, where they are (the pointer is drawn after the shader and shows up here), verdict
      post_done     the post-shader frame was written
-   Files (Documents/colorprobe/ or HV_COLOR_PROBE_DIR), NNN = capture number:
+   Files (Library/Caches/colorprobe/ or HV_COLOR_PROBE_DIR), NNN = capture number:
      frame-NNN-src.raw   displayed surface, tightly packed, BGRA8 (or RGBA half floats, see the json)
      frame-NNN-post.raw  drawable after the screen shader, tightly packed BGRA8
      gamma-NNN.bin       the gamma table bytes, if found in the surface
@@ -596,7 +596,7 @@ static void cp_start(HvReplay *r) {
     cp.t0 = now_seconds();
     const char *dir = getenv("HV_COLOR_PROBE_DIR"), *home = getenv("HOME");
     if (dir) snprintf(cp.dir, sizeof cp.dir, "%s", dir);
-    else snprintf(cp.dir, sizeof cp.dir, "%s/Documents/colorprobe", home ? home : "/tmp");
+    else snprintf(cp.dir, sizeof cp.dir, "%s/Library/Caches/colorprobe", home ? home : "/tmp");
     mkdir(cp.dir, 0755);
     snprintf(cp.trigger, sizeof cp.trigger, "%s/trigger", cp.dir);
     snprintf(cp.mode_linear, sizeof cp.mode_linear, "%s/mode-linear", cp.dir);

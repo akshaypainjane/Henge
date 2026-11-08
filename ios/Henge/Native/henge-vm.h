@@ -11,6 +11,7 @@
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, int camera, const HvVmTuning *tuning, char *err, size_t errlen);
 int henge_vm_camera_available(void);
+int henge_vm_camera_diagnostics_conflict(void);
 int henge_vm_camera_sharing(void);
 int henge_vm_camera_frame_rate(void);
 int henge_vm_camera_share(int enabled);
@@ -34,8 +35,6 @@ int henge_vm_state(void);
 /* Why it stopped (an HV_EXIT_* name), once state is 2. */
 const char *henge_vm_exit_reason(void);
 void henge_vm_stop(void);
-/* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
-int henge_vm_knob(const char *name, int value);
 
 /* Progress, for the session screen. */
 uint64_t henge_vm_blocks(void);                    /* blocks the CPUs entered */

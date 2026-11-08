@@ -54,7 +54,11 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
     return 0;
 }
 
-int henge_vm_camera_available(void) { return state == 1 && hv_vm_board()->camera != NULL; }
+int henge_vm_camera_diagnostics_conflict(void) { return hv_pvg_lite_frame_diagnostics_enabled(); }
+
+int henge_vm_camera_available(void) {
+    return state == 1 && hv_vm_board()->camera != NULL && !henge_vm_camera_diagnostics_conflict();
+}
 
 int henge_vm_camera_frame_rate(void) { return HV_UVC_FPS; }
 
@@ -65,7 +69,7 @@ int henge_vm_camera_sharing(void) {
 int henge_vm_camera_share(int enabled) {
     pthread_mutex_lock(&camera_lock);
     HvXhci *camera = hv_vm_board()->camera;
-    int available = camera && (!enabled || state == 1);
+    int available = camera && (!enabled || henge_vm_camera_available());
     if (available) hv_xhci_camera_share(camera, enabled != 0);
     pthread_mutex_unlock(&camera_lock);
     return available ? 0 : -1;
@@ -137,9 +141,6 @@ int henge_make_aux(const char *path) {
 int henge_vm_state(void) { return state; }
 const char *henge_vm_exit_reason(void) { return hv_vm_reason_name(exit_reason); }
 void henge_vm_stop(void) { if (state == 1) hv_vm_stop(); }
-
-/* Testing (Autopilot.swift): a translation knob, as "knob NAME VALUE" in the Mac tool's input file. */
-int henge_vm_knob(const char *name, int value) { return state == 1 ? hv_knob_set(hv_vm_machine(), name, value) : 0; }
 
 uint64_t henge_vm_blocks(void) { return state ? hv_vm_machine()->stats.blocks : 0; }
 uint32_t henge_vm_jit_generation(void) {

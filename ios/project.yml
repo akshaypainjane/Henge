@@ -51,6 +51,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: $(HENGE_ENTITLEMENTS)
         SWIFT_OBJC_BRIDGING_HEADER: Henge/HengeBridge.h
         TARGETED_DEVICE_FAMILY: "1,2"
+        HENGE_IOS_DIAGNOSTICS: "0"
+        HENGE_ENGINE_BUILD_DIR: ios
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
           - "@executable_path/Frameworks"
@@ -60,14 +62,14 @@ targets:
           - "$(SRCROOT)/../devices"
         LIBRARY_SEARCH_PATHS:
           - "$(inherited)"
-          - "$(SRCROOT)/../build/ios"
+          - "$(SRCROOT)/../build/$(HENGE_ENGINE_BUILD_DIR)"
           - "$(SRCROOT)/deps/lib"
         OTHER_LDFLAGS:
           - "$(inherited)"
           # The engine (make ios-lib) and what its network needs (scripts/fetch_deps.sh).
           - "-lhengevm"
           # The installer (tools/build_ios_restore.sh): libirecovery, usbmuxd, idevicerestore and their libraries.
-          - "-lhengerestore"
+          - '"$(SRCROOT)/../build/ios/libhengerestore.a"'
           - "-lz"
           - "-lslirp"
           - "-lglib-2.0"
@@ -87,6 +89,10 @@ targets:
           - "AVFAudio"
           - "-framework"
           - "CoreFoundation"
+      configs:
+        Debug:
+          HENGE_IOS_DIAGNOSTICS: "1"
+          HENGE_ENGINE_BUILD_DIR: ios-debug
     dependencies:
       # Built-in StikJIT's debugger process. Embedded into PlugIns/.
       - target: HengeJITHelper
@@ -95,7 +101,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz
+          make ios-lib build/henge-agent.gz HENGE_IOS_DIAGNOSTICS="$HENGE_IOS_DIAGNOSTICS"
           ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:

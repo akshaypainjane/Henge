@@ -498,6 +498,10 @@ struct SessionView: View {
                         }
                         Text("Shares live video locally with this Mac. Camera access ends when Henge leaves the foreground.")
                             .font(.footnote).foregroundStyle(.secondary)
+                        if henge_vm_camera_diagnostics_conflict() != 0 {
+                            Text("Restart Henge without frame capture diagnostics to share the camera.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Section("Local SSH") {

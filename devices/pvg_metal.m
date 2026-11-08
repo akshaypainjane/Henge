@@ -43,6 +43,7 @@ static int cursor_scale(void) {
 #include <string.h>
 
 #include "pvg_lite.h"
+#include "pvg_diagnostics.h"
 
 #if !TARGET_OS_IPHONE
 #import <CoreGraphics/CoreGraphics.h>
@@ -228,7 +229,7 @@ static _Atomic int hv_half_mode = -1;
 static int hv_half_mode_get(void) {
     int m = atomic_load(&hv_half_mode);
     if (m < 0) {
-        const char *e = getenv("HV_PVG_HALF");
+        const char *e = hv_pvg_diagnostic_env("HV_PVG_HALF");
         m = e && !strcmp(e, "linear") ? 1 : 0;
         atomic_store(&hv_half_mode, m);
     }
@@ -239,7 +240,9 @@ static float hv_half_shown(float v, int mode) { /* what the screen shows for a h
     return mode == 1 ? (v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f) : v;
 }
 
-#include "pvg_colorprobe.h" /* HV_COLOR_PROBE: what the display is told and shown, for chasing colour problems */
+#if HENGE_PVG_DIAGNOSTICS
+#include "pvg_colorprobe.h"
+#endif
 
 /* A contiguous view of a task's guest pages; holes are left as zero pages. */
 /* A range of task memory at one address, page by page. Metal pins a buffer's
@@ -419,7 +422,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 }
 
 - (id)makeFunction:(uint64_t)at task:(uint32_t)task {
-    if (getenv("HV_PVG_FAIL_LIBS")) { /* testing: every library refused, as an OS that cannot load them does */
+    if (hv_pvg_diagnostic_env("HV_PVG_FAIL_LIBS")) { /* testing: every library refused, as an OS that cannot load them does */
         [self complain:@"library: refused (HV_PVG_FAIL_LIBS)"];
         return nil;
     }
@@ -435,8 +438,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         return nil;
     }
     {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
-        const char *tf = getenv("HV_PVG_TRACE_FILE");
-        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+        const char *tf = hv_pvg_diagnostic_env("HV_PVG_TRACE_FILE");
+        if (tf && hv_pvg_diagnostic_env("HV_SHADER_DUMP") && atoi(hv_pvg_diagnostic_env("HV_SHADER_DUMP"))) {
             NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
             [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
@@ -470,7 +473,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
         if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
-        if (tag == 0xe && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
+        if (tag == 0xe && hv_pvg_diagnostic_env("HV_SHADER_DUMP") && atoi(hv_pvg_diagnostic_env("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
             MTLRenderPipelineDescriptor *rp = descriptor;
             for (int i = 0; i < 4; i++) {
                 MTLRenderPipelineColorAttachmentDescriptor *c = rp.colorAttachments[i];
@@ -482,7 +485,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
                         (unsigned long)c.writeMask);
             }
         }
-        if (state && tag == 0xe && getenv("HV_PVG_TRACE_FILE")) {
+        if (state && tag == 0xe && hv_pvg_diagnostic_env("HV_PVG_TRACE_FILE")) {
             MTLRenderPipelineDescriptor *rp = descriptor;
             objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"%@ / %@ -> fmt %lu blend %d", rp.vertexFunction.name, rp.fragmentFunction.name, (unsigned long)rp.colorAttachments[0].pixelFormat, (int)rp.colorAttachments[0].blendingEnabled], OBJC_ASSOCIATION_RETAIN);
         }
@@ -580,7 +583,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     o->vpage = h.vpage;
     o->guest_backed = YES;
     heap_bytes += h.length;
-    if (getenv("HV_PVG_HEAP_LOG")) fprintf(stderr, "hengevm: pvg-metal: heap %llu KB at page %u, flags %x, now %llu MB of heaps\n", h.length >> 10, h.vpage, h.flags, heap_bytes >> 20);
+    if (hv_pvg_diagnostic_env("HV_PVG_HEAP_LOG")) fprintf(stderr, "hengevm: pvg-metal: heap %llu KB at page %u, flags %x, now %llu MB of heaps\n", h.length >> 10, h.vpage, h.flags, heap_bytes >> 20);
 }
 
 /* A buffer in a heap: {heap, offset, length}. */
@@ -839,7 +842,7 @@ static void sync_iosurface(HvObject *s, id<MTLCommandBuffer> command) {
     IOSurfaceUnlock(s->iosurface, 0, NULL);
     if (!copied) return;
     s->content_hash = hash;
-    const char *dump = getenv("HV_PVG_SURFACE_DUMP");
+    const char *dump = hv_pvg_diagnostic_env("HV_PVG_SURFACE_DUMP");
     static int dumped;
     if (dump && s->plane_count && dumped < 6) {
         char path[1100];
@@ -1933,7 +1936,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
 /* Commits without waiting: the next batch can be encoded while the GPU does this one. */
 - (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete {
     static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
-    if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
+    if (sync < 0) sync = hv_pvg_diagnostic_env("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
     atomic_fetch_add(&inflight, 1);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -1969,7 +1972,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
     const uint8_t *bufs = (const uint8_t *)(res + nres * 2);
     static const char *trace_file;
     static BOOL trace_checked;
-    if (!trace_checked) trace_checked = YES, trace_file = getenv("HV_PVG_TRACE_FILE");
+    if (!trace_checked) trace_checked = YES, trace_file = hv_pvg_diagnostic_env("HV_PVG_TRACE_FILE");
     tracing = trace_file && access(trace_file, F_OK) == 0;
     if (tracing) fprintf(stderr, "trace: exec task %u, %u resources, %u buffers\n", task, nres, nbuf);
     double t_begin = now_seconds();
@@ -1981,7 +1984,7 @@ static BOOL blit_buffer_fits(id<MTLBuffer> b, id<MTLTexture> t, uint64_t off, ui
         if (!o) continue;
         if (o->mapped) refresh_pages(self, task, o);
         if (o->surface) sync_iosurface(o->surface, cb);
-        if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
+        if (hv_pvg_diagnostic_env("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
             if (seen[key] != f + 1) {
@@ -2150,7 +2153,7 @@ static const uint8_t *half_to_byte(void) {
     cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
     cursor_tex = glyph;
     os_unfair_lock_unlock(&screen_lock);
-    if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor glyph %ux%u hot %d,%d stride %u first alpha %u\n", w, h, hx, hy, (uint32_t)stride, bits[(size_t)(h / 2) * stride + (size_t)(w / 2) * 4 + 3]);
+    if (hv_pvg_diagnostic_env("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor glyph %ux%u hot %d,%d stride %u first alpha %u\n", w, h, hx, hy, (uint32_t)stride, bits[(size_t)(h / 2) * stride + (size_t)(w / 2) * 4 + 3]);
     [self drawCursor];
 }
 
@@ -2174,7 +2177,7 @@ static const uint8_t *half_to_byte(void) {
     const uint8_t *page = hv_pvg_lite_display_page(lite);
     if (!page || !cursor || !(cursor_shown || page[0xe04])) return;
     uint32_t where = __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE);
-    if (getenv("HV_PVG_CURSOR_LOG")) {
+    if (hv_pvg_diagnostic_env("HV_PVG_CURSOR_LOG")) {
         static uint32_t last;
         if (where != last) fprintf(stderr, "pvgcursor at %u,%u shown %d flag %d\n", where & 0xffff, where >> 16, cursor_shown, page[0xe04]);
         last = where;
@@ -2248,14 +2251,16 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         [CATransaction setDisableActions:YES];
         target.device = device;
         target.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        target.framebufferOnly = !(getenv("HV_PVG_GPU_TEST") || getenv("HV_COLOR_PROBE")); /* the probe copies the drawable out */
+        target.framebufferOnly = !(hv_pvg_diagnostic_env("HV_PVG_GPU_TEST") || hv_pvg_diagnostic_env("HV_COLOR_PROBE")); /* the probe copies the drawable out */
         target.allowsNextDrawableTimeout = YES;
         target.maximumDrawableCount = 3;
         [CATransaction commit];
         prepared_layer = target;
         fprintf(stderr, "hengevm: pvg-metal: half-float display surfaces are shown %s (HV_PVG_HALF=%s)\n",
                 hv_half_mode_get() == 1 ? "as LINEAR light with an sRGB encode" : "as display-encoded values, passed through", hv_half_mode_get() == 1 ? "linear" : "encoded/default");
+#if HENGE_PVG_DIAGNOSTICS
         if (cp.on) cp_log_layer(self, target);
+#endif
     }
     return YES;
 }
@@ -2437,9 +2442,11 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         }
         [e endEncoding];
+#if HENGE_PVG_DIAGNOSTICS
         if (cp.on) cp_capture_post(self, drawable.texture, W, H, cb);
+#endif
 #if !TARGET_OS_IPHONE
-        if (getenv("HV_PVG_GPU_TEST")) { /* the same pixels for a screenshot: this is the path a phone runs */
+        if (hv_pvg_diagnostic_env("HV_PVG_GPU_TEST")) { /* the same pixels for a screenshot: this is the path a phone runs */
             NSUInteger bytes = (NSUInteger)W * H * 4;
             if (!test_readback || test_readback.length < bytes) test_readback = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
             id<MTLBuffer> rb = test_readback;
@@ -2580,14 +2587,14 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->mapped_textures = [NSMutableDictionary new];
         r->surfaces = [NSMutableDictionary new];
         r->complaints = [NSMutableSet new];
-        r->shot = getenv("HV_PVG_SHOT");
+#if HENGE_PVG_DIAGNOSTICS
         cp_start(r);
-#if !TARGET_OS_IPHONE
-        if (getenv("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
 #endif
 #if !TARGET_OS_IPHONE
+        r->shot = hv_pvg_diagnostic_env("HV_PVG_SHOT");
+        if (hv_pvg_diagnostic_env("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
         if (r->shot) {
-            double every = getenv("HV_PVG_SHOT_SECS") ? atof(getenv("HV_PVG_SHOT_SECS")) : 5;
+            double every = hv_pvg_diagnostic_env("HV_PVG_SHOT_SECS") ? atof(hv_pvg_diagnostic_env("HV_PVG_SHOT_SECS")) : 5;
             dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, r->worker);
             dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(every * NSEC_PER_SEC)), (uint64_t)(every * NSEC_PER_SEC), NSEC_PER_SEC / 10);
             HvReplay *__weak weak = r;
@@ -2637,7 +2644,9 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
                         if (r->tracing) fprintf(stderr, "trace: swap to %llu\n", (uint64_t)args[3] << 32 | args[2]);
+#if HENGE_PVG_DIAGNOSTICS
                         cp_note_swap(r, (uint64_t)args[3] << 32 | args[2], args, n);
+#endif
                         [r present:(uint64_t)args[3] << 32 | args[2]];
                     }
                     if (op == 4) [r cursorGlyph:args length:n];
@@ -2645,7 +2654,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                         os_unfair_lock_lock(&r->screen_lock);
                         r->cursor_shown = args[1] & 1;
                         os_unfair_lock_unlock(&r->screen_lock);
-                        if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor show %u\n", args[1]);
+                        if (hv_pvg_diagnostic_env("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor show %u\n", args[1]);
                         [r drawCursor];
                     }
                 }

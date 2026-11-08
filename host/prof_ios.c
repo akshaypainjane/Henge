@@ -4,8 +4,9 @@
    function (kept as an offset into the app image, symbolized afterwards with the
    unstripped binary: tools/prof_symbolize.sh). Every HV_PROF_IOS_SECS seconds
    (default 30) the totals go to stderr, which Henge mirrors to henge-native.log.
-   Off unless HV_PROF_IOS is set (Documents/henge-env.txt can set it): reading a running
+   Available in diagnostics builds when HV_PROF_IOS is set at launch: reading a running
    thread's PC stops it for a moment, so sampling is not free. */
+#ifdef HENGE_IOS_DIAGNOSTICS
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <pthread.h>
@@ -21,7 +22,7 @@ extern void (*hv_prof_register)(void);
 
 #define MAX_THREADS 16
 #define SLOTS 4096
-static thread_act_t threads[MAX_THREADS];
+static _Atomic thread_act_t threads[MAX_THREADS];
 static _Atomic int nthreads;
 static struct { uintptr_t off; uint32_t n; } slots[SLOTS];
 static uint64_t total, idle, jit, other_image, unknown;
@@ -29,7 +30,7 @@ static uintptr_t image_base;
 
 static void reg(void) {
     int i = atomic_fetch_add(&nthreads, 1);
-    if (i < MAX_THREADS) threads[i] = mach_thread_self();
+    if (i < MAX_THREADS) atomic_store_explicit(&threads[i], mach_thread_self(), memory_order_release);
 }
 
 static void count_host(uintptr_t pc) {
@@ -65,7 +66,10 @@ static void dump(void) {
 
 static void *sampler(void *unused) {
     (void)unused;
-    int secs = getenv("HV_PROF_IOS_SECS") ? atoi(getenv("HV_PROF_IOS_SECS")) : 30;
+    const char *interval = getenv("HV_PROF_IOS_SECS");
+    char *end = NULL;
+    long secs = interval ? strtol(interval, &end, 10) : 30;
+    if (secs < 1 || secs > 3600 || (end && *end)) secs = 30;
     uint64_t ticks = 0;
     for (;;) {
         usleep(1000);
@@ -73,14 +77,16 @@ static void *sampler(void *unused) {
         uintptr_t lo = m ? (uintptr_t)m->jit.base : 0, hi = m ? lo + m->jit.capacity * 4 : 0;
         int n = atomic_load(&nthreads);
         for (int i = 0; i < n && i < MAX_THREADS; i++) {
+            thread_act_t thread = atomic_load_explicit(&threads[i], memory_order_acquire);
+            if (!thread) continue;
             thread_basic_info_data_t ti;
             mach_msg_type_number_t ni = THREAD_BASIC_INFO_COUNT;
-            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&ti, &ni) != KERN_SUCCESS) continue;
+            if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&ti, &ni) != KERN_SUCCESS) continue;
             total++;
             if (ti.run_state != TH_STATE_RUNNING) { idle++; continue; }
             arm_thread_state64_t st;
             mach_msg_type_number_t sn = ARM_THREAD_STATE64_COUNT;
-            if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sn) != KERN_SUCCESS) { unknown++; continue; }
+            if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&st, &sn) != KERN_SUCCESS) { unknown++; continue; }
             uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(st);
             if (pc >= lo && pc < hi) jit++;
             else count_host(pc);
@@ -98,5 +104,8 @@ void hv_prof_ios_start(void) {
     if (dladdr((void *)hv_prof_ios_start, &info)) image_base = (uintptr_t)info.dli_fbase;
     hv_prof_register = reg;
     pthread_t t;
-    pthread_create(&t, NULL, sampler, NULL);
+    if (pthread_create(&t, NULL, sampler, NULL) == 0) pthread_detach(t);
 }
+#else
+void hv_prof_ios_start(void) {}
+#endif

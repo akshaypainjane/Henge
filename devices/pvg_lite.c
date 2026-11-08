@@ -35,6 +35,7 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 #include "pvg_lite.h"
+#include "pvg_diagnostics.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -210,7 +211,7 @@ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args, u
     uint32_t gamma_bytes = n - 16;
     memcpy(gamma, args + 4, gamma_bytes < sizeof gamma ? gamma_bytes : sizeof gamma);
     memcpy(d + 0xf80, gamma, sizeof gamma);
-    if (n >= 40 && getenv("HV_COLOR_PROBE")) { /* Optional gamma diagnostics. */
+    if (n >= 40 && hv_pvg_diagnostic_env("HV_COLOR_PROBE")) { /* Optional gamma diagnostics. */
         static uint32_t last[6];
         if (memcmp(last, args + 4, sizeof last)) {
             memcpy(last, args + 4, sizeof last);
@@ -384,6 +385,8 @@ void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
     return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
 }
+
+int hv_pvg_lite_frame_diagnostics_enabled(void) { return hv_pvg_frame_diagnostics_enabled(); }
 
 int hv_pvg_lite_snapshot(HvPvgLite *p, uint8_t *bgra, uint32_t width, uint32_t height) {
     return p && p->metal ? hv_pvg_metal_snapshot(p->metal, bgra, width, height) : -1;
@@ -581,7 +584,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: ch %u op %x len %x stamp %x\n", ch, hdr[0], hdr[1], hdr[2]);
         {   /* HV_PVG_TRACE_FILE exists: the order commands reach the device in, with what a swap says */
             static const char *tf; static int tf_read;
-            if (!tf_read) tf_read = 1, tf = getenv("HV_PVG_TRACE_FILE");
+            if (!tf_read) tf_read = 1, tf = hv_pvg_diagnostic_env("HV_PVG_TRACE_FILE");
             if (tf && access(tf, F_OK) == 0) {
                 uint32_t w[12] = {0};
                 ring_read(p, table, size, rd + 12, w, hdr[1] - 12 < sizeof w ? hdr[1] - 12 : sizeof w);
@@ -591,7 +594,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         os_unfair_lock_lock(&p->layer_lock);
         if (!p->metal_tried) {
             p->metal_tried = 1;
-            HvPvgMetal *metal = getenv("HV_PVG_NO_METAL") ? NULL : hv_pvg_metal_create(p);
+            HvPvgMetal *metal = hv_pvg_diagnostic_env("HV_PVG_NO_METAL") ? NULL : hv_pvg_metal_create(p);
             if (metal && p->layer_set) hv_pvg_metal_set_layer(metal, (void *)p->layer);
             atomic_store_explicit(&p->metal, metal, memory_order_release);
         }
@@ -758,8 +761,8 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
     p->iosfc_irq = iosfc_irq;
     const char *hz = getenv("HV_HZ");
     hv_pvg_lite_set_refresh_rate(p, hz ? (uint32_t)atoi(hz) : 60);
-    p->log = getenv("HV_PVG_LITE_LOG") != NULL;
-    p->tally = getenv("HV_PVG_TALLY") != NULL;
+    p->log = hv_pvg_diagnostic_env("HV_PVG_LITE_LOG") != NULL;
+    p->tally = hv_pvg_diagnostic_env("HV_PVG_TALLY") != NULL;
     hv_machine_add_mmio(m, gfx_pa, 0x10000, p, gfx_read, gfx_write, "gfx");
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, p, iosfc_read, iosfc_write, "iosurface");
     return p;

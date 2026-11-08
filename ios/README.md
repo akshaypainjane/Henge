@@ -66,3 +66,16 @@ Code from Husk (GPL-2.0-or-later): `Henge/JIT/*`, `Henge/HengeLog.swift`,
 `Henge/Native/henge-ios-jit.*`, `henge-brk.S`, `HengeJITHelper/`. StikJIT is
 MPL-2.0 and idevice MIT (`Henge/Resources/legal/`); `tcg-apple-jit.h` is QEMU's
 (LGPL-2.1). See [docs/licensing.md](../docs/licensing.md).
+# Debugging the guest
+
+Use the Xcode **Debug** configuration for device automation, the sampling profiler,
+and the color probe. Debug and Release link different engine archives.
+
+To automate a Debug launch, copy a complete UTF-8 plan into
+`Library/Caches/henge-autopilot.txt` in the app container with `devicectl`, then
+launch with `HENGE_AUTOPILOT=1`. The app consumes the plan once. Commands are
+`mac [NAME]`, `wait SECONDS` (up to 300 seconds), `type TEXT`, `key CODE`,
+`cmd KEY`, `log`, `stop`, and `exit`. The plan is limited to 64 KiB and 256 commands.
+
+Use `tools/colorprobe/probe.sh` for the color probe. It stores captures in the
+app's cache. Restart without frame capture flags to use the iPad camera.
