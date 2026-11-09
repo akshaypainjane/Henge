@@ -1,5 +1,6 @@
 #include "harness.h"
 
+#include <stdbool.h>
 #include <stdlib.h>
 
 #include "mmu.h"
@@ -55,7 +56,7 @@ static uint64_t pt_alloc(void) {
     return pa;
 }
 
-static void map_page(uint64_t va, uint64_t pa) {
+static void map_page(uint64_t va, uint64_t pa, unsigned ap) {
     uint64_t table = ttbr0;
     for (int level = 0; level < 3; level++) {
         int shift = 14 + 11 * (3 - level);
@@ -63,21 +64,23 @@ static void map_page(uint64_t va, uint64_t pa) {
         if (!(*e & 1)) *e = pt_alloc() | 3;
         table = *e & 0x0000ffffffffc000ull;
     }
-    /* page, AttrIndx 0 (normal), AP=00 (EL1 RW), inner shareable, AF */
-    pt_host(table)[(va >> 14) & 0x7ff] = pa | 3 | 3u << 8 | 1u << 10;
+    /* Page, AttrIndx 0 (normal), access permissions, inner shareable, AF. */
+    pt_host(table)[(va >> 14) & 0x7ff] = pa | 3 | ap << 6 | 3u << 8 | 1u << 10;
 }
 
-static void map_range(uint64_t va, uint64_t pa, uint64_t size) {
-    for (uint64_t off = 0; off < size; off += 16384) map_page(va + off, pa + off);
+static void map_range(uint64_t va, uint64_t pa, uint64_t size, unsigned ap) {
+    for (uint64_t off = 0; off < size; off += 16384) map_page(va + off, pa + off, ap);
 }
 
-static void build_page_tables(void) {
+static void build_page_tables(bool user) {
     pt_next = 0;
     ttbr0 = pt_alloc();
     uint64_t code = (uint64_t)(uintptr_t)mem_programs_begin;
-    map_range(code, code, mem_programs_finish - mem_programs_begin);
-    map_range((uint64_t)(uintptr_t)stack, (uint64_t)(uintptr_t)stack, STACK_SIZE);
-    map_range((uint64_t)(uintptr_t)data, DATA_PA, DATA_SIZE);
+    /* EL0 executes read-only code and needs read-write access to stack and data. */
+    unsigned data_ap = user ? 1 : 0;
+    map_range(code, code, mem_programs_finish - mem_programs_begin, user ? 3 : 0);
+    map_range((uint64_t)(uintptr_t)stack, (uint64_t)(uintptr_t)stack, STACK_SIZE, data_ap);
+    map_range((uint64_t)(uintptr_t)data, DATA_PA, DATA_SIZE, data_ap);
 }
 
 static void mmu_on(HvCpu *cpu) {
@@ -86,6 +89,12 @@ static void mmu_on(HvCpu *cpu) {
     cpu->ttbr0_el1 = ttbr0;
     cpu->sctlr_el1 |= 1 | 1u << 2 | 1u << 12;                   /* M, C, I */
     hv_tlb_flush(cpu);
+}
+
+static void mmu_on_el0(HvCpu *cpu) {
+    cpu->el = 0;
+    cpu->sctlr_el1 |= 1u << 14 | 1u << 15 | 1u << 26; /* DZE, UCT, UCI: DC ZVA, CTR_EL0, cache ops */
+    mmu_on(cpu);
 }
 
 /* A device that logs every access and answers reads with offset * 0x01010101 + size. */
@@ -153,16 +162,24 @@ int main(void) {
     hv_machine_add_ram(&m, (uint64_t)(uintptr_t)data, DATA_SIZE, data, 0);
     hv_machine_add_ram(&m, DATA_PA, DATA_SIZE, data, 0); /* the same memory, at another PA */
     hv_machine_add_ram(&m, PT_PA, PT_SIZE, pt, 0);
-    build_page_tables();
+    build_page_tables(false);
     m.trace = getenv("HV_TRACE") != NULL;
 
-    static const char *mode_names[] = {"C slow path", "fast path", "fast path, MMU on"};
+    enum { C_SLOW, FAST, EL1_MMU, EL0_MMU };
+    static const struct { const char *name; void (*setup)(HvCpu *); } modes[] = {
+        [C_SLOW] = {"C slow path", NULL},
+        [FAST] = {"fast path", NULL},
+        [EL1_MMU] = {"fast path, MMU on", mmu_on},
+        [EL0_MMU] = {"fast path, EL0", mmu_on_el0},
+    };
     size_t count = sizeof programs / sizeof programs[0];
+    size_t mode_count = sizeof modes / sizeof modes[0];
     int failed = 0;
     static uint8_t native_data[DATA_SIZE];
-    for (int mode = 0; mode < 3; mode++) {
-        m.slow_mem = mode == 0;
+    for (size_t mode = 0; mode < mode_count; mode++) {
+        m.slow_mem = mode == C_SLOW;
         hv_flush_blocks(&m);
+        if (mode == EL0_MMU) build_page_tables(true);
         for (size_t i = 0; i < count; i++) {
             const TestProgram *p = &programs[i];
             static HvCpu init, native, jit;
@@ -174,7 +191,7 @@ int main(void) {
             memcpy(native_data, data, DATA_SIZE);
             reset_data();
             m.stat_slow_mem = 0;
-            int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : NULL);
+            int bad = run_jit(&m, p, &init, &jit, modes[mode].setup);
             if (!bad) bad = compare_cpus(p->name, &native, &jit);
             for (size_t off = 0; off < DATA_SIZE && !bad; off += 8)
                 if (memcmp(native_data + off, data + off, 8) != 0) {
@@ -185,7 +202,7 @@ int main(void) {
                            (unsigned long long)b);
                     bad = 1;
                 }
-            printf("%-11s %-18s: %-4s (%llu slow-path accesses)\n", p->name, mode_names[mode], bad ? "FAIL" : "ok",
+            printf("%-11s %-18s: %-4s (%llu slow-path accesses)\n", p->name, modes[mode].name, bad ? "FAIL" : "ok",
                    (unsigned long long)m.stat_slow_mem);
             failed += bad != 0;
         }
@@ -193,7 +210,7 @@ int main(void) {
     hv_machine_add_mmio(&m, 0x20000000, 0x1000, NULL, dev_read, dev_write, "test device");
     m.slow_mem = 0;
     failed += test_mmio(&m);
-    printf("%zu programs x 3 modes + mmio, %d failures, %llu chained exits\n", count, failed,
+    printf("%zu programs x %zu modes + mmio, %d failures, %llu chained exits\n", count, mode_count, failed,
            (unsigned long long)m.stats.chained);
     return failed != 0;
 }
