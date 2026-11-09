@@ -6,6 +6,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* Bound each host syscall independently of the guest request size. */
+#define DISK_IO_CHUNK (128u << 20)
+
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly, bool uncached_writes) {
     d->write_fd = -1;
     d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
@@ -45,7 +48,9 @@ int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len) {
     if (off > d->size || len > d->size - off) return -1;
     uint8_t *p = buf;
     while (len) {
-        ssize_t n = pread(d->fd, p, len, (off_t)(d->offset + off));
+        size_t count = len > DISK_IO_CHUNK ? DISK_IO_CHUNK : (size_t)len;
+        ssize_t n = pread(d->fd, p, count, (off_t)(d->offset + off));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;
@@ -59,7 +64,9 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
     int fd = d->write_fd >= 0 ? d->write_fd : d->fd;
     const uint8_t *p = buf;
     while (len) {
-        ssize_t n = pwrite(fd, p, len, (off_t)(d->offset + off));
+        size_t count = len > DISK_IO_CHUNK ? DISK_IO_CHUNK : (size_t)len;
+        ssize_t n = pwrite(fd, p, count, (off_t)(d->offset + off));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;
